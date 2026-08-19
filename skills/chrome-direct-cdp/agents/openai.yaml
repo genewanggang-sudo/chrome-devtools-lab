@@ -1,0 +1,4 @@
+interface:
+  display_name: "Direct Chrome CDP"
+  short_description: "Control exact Chrome targets with trusted input"
+  default_prompt: "Use $chrome-direct-cdp for strict target-bound Chrome control and input."

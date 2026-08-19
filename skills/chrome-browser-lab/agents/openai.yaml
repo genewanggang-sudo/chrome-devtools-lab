@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chrome Browser Lab"
+  short_description: "Coordinate reliable Chrome testing and debugging"
+  default_prompt: "Use $chrome-browser-lab to inspect or test the exact Chrome target."

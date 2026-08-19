@@ -1,0 +1,41 @@
+{
+  "name": "chrome-devtools-lab",
+  "version": "0.1.0+codex.20260819010534",
+  "description": "A maintainable Chrome browser testing, debugging, control, and performance-analysis toolkit.",
+  "author": {
+    "name": "Gene Wang",
+    "email": "gene.wanggang@gmail.com",
+    "url": "https://github.com/genewanggang-sudo"
+  },
+  "homepage": "https://github.com/genewanggang-sudo/chrome-devtools-lab",
+  "repository": "https://github.com/genewanggang-sudo/chrome-devtools-lab",
+  "license": "MIT",
+  "keywords": [
+    "chrome",
+    "devtools",
+    "cdp",
+    "browser-testing",
+    "webgl",
+    "performance"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Chrome DevTools Lab",
+    "shortDescription": "Reliable Chrome testing, debugging, and performance analysis.",
+    "longDescription": "Combines Chrome DevTools MCP with strict direct CDP control for exact targets, trusted input, WebGL inspection, trace evidence, and repeatable browser gates.",
+    "developerName": "Gene Wang",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Browser testing",
+      "Performance analysis",
+      "WebGL debugging"
+    ],
+    "defaultPrompt": [
+      "Run a reliable browser gate against the exact Chrome target.",
+      "Profile this WebGL interaction and attribute the bottleneck.",
+      "Compare two browser targets with matched input and frame contracts."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

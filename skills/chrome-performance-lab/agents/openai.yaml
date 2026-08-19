@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chrome Performance Lab"
+  short_description: "Attribute browser and WebGL performance bottlenecks"
+  default_prompt: "Use $chrome-performance-lab to capture and attribute browser performance evidence."
