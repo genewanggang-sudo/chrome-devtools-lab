@@ -9,6 +9,7 @@ import {
   analyzeCompositorFps,
   findTraceWindow,
 } from "./frame-rate.mjs";
+import { acquireTraceLock } from "./trace-lock.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9333;
@@ -940,10 +941,11 @@ async function main(options) {
     typeof options["trace-output"] === "string"
       ? options["trace-output"]
       : `${output}.trace.json`;
-  const { target } = await selectTarget(options);
+  const { target, host, port } = await selectTarget(options);
   const session = await connect(target.webSocketDebuggerUrl, timeoutMs);
   let tracingStarted = false;
   let traceComplete = null;
+  let traceLock = null;
   const collectedEvents = [];
   const traceBufferUsageSamples = [];
   const fpsCounter = {
@@ -1014,6 +1016,12 @@ async function main(options) {
     });
     await sleep(POINTER_SETTLE_MS);
     const beforeHash = await captureCanvasHash(session, canvas);
+    traceLock = await acquireTraceLock({
+      host,
+      port,
+      timeoutMs,
+      metadata: { script: "wheel-benchmark", targetId: target.id },
+    });
     await session.send("Tracing.start", {
       categories: TRACE_CATEGORIES,
       options: "record-continuously",
@@ -1117,6 +1125,8 @@ async function main(options) {
     const traceText = complete.stream
       ? await readTraceStream(session, complete.stream)
       : JSON.stringify({ traceEvents: collectedEvents });
+    await traceLock.release();
+    traceLock = null;
     const parsedTrace = JSON.parse(traceText);
     const trace = Array.isArray(parsedTrace)
       ? { traceEvents: parsedTrace }
@@ -1385,6 +1395,11 @@ async function main(options) {
     if (tracingStarted) {
       try {
         await session.send("Tracing.end");
+      } catch {}
+    }
+    if (traceLock) {
+      try {
+        await traceLock.release();
       } catch {}
     }
     if (showFpsCounter) {

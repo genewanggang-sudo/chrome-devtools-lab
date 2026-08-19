@@ -8,11 +8,13 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { compareCanvasAnchors } from "./canvas-anchor.mjs";
 
 const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const CDP_SCRIPT = path.join(SCRIPT_DIRECTORY, "cdp.mjs");
 const WHEEL_SCRIPT = path.join(SCRIPT_DIRECTORY, "wheel-benchmark.mjs");
 const ANALYZE_SCRIPT = path.join(SCRIPT_DIRECTORY, "analyze-trace.mjs");
+const FPS_OVERLAY_SCRIPT = path.join(SCRIPT_DIRECTORY, "fps-overlay.mjs");
 const CONFIG_SCHEMA_VERSION = 1;
 const CAPTURE_SCHEMA_VERSION = 5;
 const ANALYSIS_SCHEMA_VERSION = 2;
@@ -548,6 +550,145 @@ class NodeProcessRunner {
   }
 }
 
+class NativeFpsOverlaySession {
+  constructor(child, ready, closePromise) {
+    this.child = child;
+    this.ready = ready;
+    this.closePromise = closePromise;
+    this.stopPromise = null;
+  }
+
+  static async start(target, timeoutMs) {
+    const child = spawn(
+      process.execPath,
+      [
+        FPS_OVERLAY_SCRIPT,
+        "--target-exact",
+        target.id,
+        "--until-stop",
+        "--timeout",
+        String(timeoutMs),
+      ],
+      {
+        cwd: SCRIPT_DIRECTORY,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let stderr = "";
+    let launchError = null;
+    let closeResolve;
+    const closePromise = new Promise((resolve) => {
+      closeResolve = resolve;
+    });
+    child.on("error", (error) => {
+      launchError = error;
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 16000) {
+        stderr += chunk.toString().slice(0, 16000 - stderr.length);
+      }
+    });
+    child.on("close", (exitCode, signal) => {
+      closeResolve({ exitCode, signal, stderr: stderr.trim() });
+    });
+
+    const ready = await new Promise((resolve, reject) => {
+      let pending = "";
+      let settled = false;
+      let timer = null;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        callback(value);
+      };
+      timer = setTimeout(() => {
+        finish(
+          reject,
+          new Error(`Timed out after ${timeoutMs}ms waiting for the native FPS overlay on ${target.id}.`),
+        );
+      }, timeoutMs);
+      child.stdout.on("data", (chunk) => {
+        pending += chunk.toString();
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop();
+        for (const line of lines) {
+          if (line.trim().length === 0) continue;
+          try {
+            const value = JSON.parse(line);
+            if (value.event === "ready") {
+              finish(resolve, value);
+              return;
+            }
+          } catch (error) {
+            finish(
+              reject,
+              new Error(`Native FPS overlay returned invalid readiness JSON: ${error.message}`),
+            );
+            return;
+          }
+        }
+      });
+      child.on("close", (exitCode, signal) => {
+        finish(
+          reject,
+          new Error(
+            `Native FPS overlay exited before readiness for ${target.id}: exit=${String(exitCode)} signal=${String(signal)} ${stderr.trim()}`,
+          ),
+        );
+      });
+      child.on("error", (error) => {
+        finish(reject, new Error(`Native FPS overlay could not start: ${error.message}`));
+      });
+    }).catch(async (error) => {
+      if (!child.killed && child.exitCode === null) child.kill("SIGTERM");
+      await closePromise;
+      throw launchError ? new Error(`Native FPS overlay could not start: ${launchError.message}`) : error;
+    });
+    if (
+      ready.target?.id !== target.id ||
+      ready.overlay?.enabled !== true ||
+      ready.overlay?.untilStop !== true
+    ) {
+      if (!child.killed && child.exitCode === null) child.kill("SIGTERM");
+      await closePromise;
+      throw new Error(`Native FPS overlay readiness did not match target ${target.id}.`);
+    }
+    return new NativeFpsOverlaySession(child, ready, closePromise);
+  }
+
+  describe() {
+    return {
+      target: this.ready.target,
+      source: this.ready.overlay?.source ?? null,
+      enabled: this.ready.overlay?.enabled === true,
+      sessionHeld: this.ready.overlay?.sessionHeld === true,
+      numericValueReturnedByCdp: this.ready.overlay?.numericValueReturnedByCdp === true,
+    };
+  }
+
+  async stop() {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = (async () => {
+      if (!this.child.killed && this.child.exitCode === null) {
+        try {
+          this.child.stdin.write("stop\n");
+          this.child.stdin.end();
+        } catch {}
+      }
+      const timeout = Timer.sleep(5000).then(() => null);
+      let closed = await Promise.race([this.closePromise, timeout]);
+      if (closed === null && !this.child.killed && this.child.exitCode === null) {
+        this.child.kill("SIGTERM");
+        closed = await this.closePromise;
+      }
+      return closed;
+    })();
+    return this.stopPromise;
+  }
+}
+
 class Timer {
   static sleep(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -813,7 +954,7 @@ class SummaryStore {
         rules: {
           targetDiscovery: "Each round runs cdp.mjs status and list, then requires one exact URL match per target.",
           noForegroundActivation: true,
-          surfacePreparation: "Each exact target is prepared through Target.activateTarget and minimized windows are restored without Page.bringToFront or Windows foreground activation.",
+          surfacePreparation: "No Page.bringToFront, Target.activateTarget, or Windows foreground activation is used. Existing visible targets are validated in place.",
           canvas: "Largest visible canvas; CSS size and drawingBuffer/DPR are read back before sampling.",
           windowNormalization:
             this.config.environment.canvasCssSize === null
@@ -900,57 +1041,90 @@ class ComparisonRunner {
       sampleIds: [],
     };
     this.summary.addRound(round);
-    this.progress(`round ${roundNumber}/${this.config.sample.rounds}: reload and wait`);
-    await this.reloadAndWait(discovered);
-    round.setup = await this.runSetup(discovered);
-    let environments = await Promise.all(
-      discovered.map((target, targetIndex) =>
-        this.readEnvironment(target, targetIndex),
-      ),
-    );
-    if (this.config.environment.canvasCssSize !== null) {
-      round.windowNormalization = await this.normalizeCanvasWindows(
-        discovered,
-        environments,
-      );
-      environments = await Promise.all(
+    let overlaySessions = [];
+    try {
+      this.progress(`round ${roundNumber}/${this.config.sample.rounds}: reload and wait`);
+      await this.reloadAndWait(discovered);
+      round.setup = await this.runSetup(discovered);
+      let environments = await Promise.all(
         discovered.map((target, targetIndex) =>
           this.readEnvironment(target, targetIndex),
         ),
       );
-    }
-    for (let targetIndex = 0; targetIndex < environments.length; targetIndex += 1) {
-      const expectedUrl = this.config.targets[targetIndex].match.urlExact;
-      if (environments[targetIndex].url !== expectedUrl) {
-        throw new ContractError(
-          `Target ${this.config.targets[targetIndex].name} URL changed after setup: expected ${expectedUrl}, actual ${environments[targetIndex].url}.`,
+      if (this.config.environment.canvasCssSize !== null) {
+        round.windowNormalization = await this.normalizeCanvasWindows(
+          discovered,
+          environments,
+        );
+        environments = await Promise.all(
+          discovered.map((target, targetIndex) =>
+            this.readEnvironment(target, targetIndex),
+          ),
         );
       }
-    }
-    const environmentContract = CanvasEnvironment.compare(
-      environments[0],
-      environments[1],
-      this.config.targets.map((target) => target.name),
-      this.config.environment.canvasCssSize,
-    );
-    round.environment = environmentContract;
-    if (!environmentContract.valid) {
-      throw new ContractError(
-        `Round ${roundNumber} environment contract failed: ${environmentContract.invalidReasons.join(" ")}`,
-        environmentContract.invalidReasons,
+      for (let targetIndex = 0; targetIndex < environments.length; targetIndex += 1) {
+        const expectedUrl = this.config.targets[targetIndex].match.urlExact;
+        if (environments[targetIndex].url !== expectedUrl) {
+          throw new ContractError(
+            `Target ${this.config.targets[targetIndex].name} URL changed after setup: expected ${expectedUrl}, actual ${environments[targetIndex].url}.`,
+          );
+        }
+      }
+      const environmentContract = CanvasEnvironment.compare(
+        environments[0],
+        environments[1],
+        this.config.targets.map((target) => target.name),
+        this.config.environment.canvasCssSize,
       );
-    }
-    this.progress(`round ${roundNumber}/${this.config.sample.rounds}: sample ${order[0]} then ${order[1]}`);
-    for (const targetIndex of order) {
-      const sample = await this.runSample(
+      round.environment = environmentContract;
+      if (!environmentContract.valid) {
+        throw new ContractError(
+          `Round ${roundNumber} environment contract failed: ${environmentContract.invalidReasons.join(" ")}`,
+          environmentContract.invalidReasons,
+        );
+      }
+      const anchorContract = await this.compareCanvasAnchors(
+        discovered,
+        environments,
         roundNumber,
-        targetIndex,
-        discovered[targetIndex],
-        environments[targetIndex],
-        environmentContract,
       );
-      this.summary.addSample(sample);
-      round.sampleIds.push(sample.sampleId);
+      round.anchor = anchorContract;
+      if (!anchorContract.valid) {
+        throw new ContractError(
+          `Round ${roundNumber} camera/model anchor contract failed: ${anchorContract.reasons.join(" ")}`,
+          anchorContract.reasons,
+        );
+      }
+      if (this.config.sample.showFpsCounter) {
+        this.progress(`round ${roundNumber}/${this.config.sample.rounds}: enable native FPS overlays`);
+        overlaySessions = await this.startNativeFpsOverlays(discovered);
+        round.fpsOverlay = {
+          requested: true,
+          targets: overlaySessions.map((session) => session.describe()),
+        };
+      } else {
+        round.fpsOverlay = { requested: false, targets: [] };
+      }
+      this.progress(`round ${roundNumber}/${this.config.sample.rounds}: sample ${order[0]} then ${order[1]}`);
+      for (const targetIndex of order) {
+        const sample = await this.runSample(
+          roundNumber,
+          targetIndex,
+          discovered[targetIndex],
+          environments[targetIndex],
+          environmentContract,
+          anchorContract,
+          overlaySessions[targetIndex] ?? null,
+        );
+        this.summary.addSample(sample);
+        round.sampleIds.push(sample.sampleId);
+      }
+    } finally {
+      if (overlaySessions.length > 0) {
+        round.fpsOverlayCleanup = await Promise.all(
+          overlaySessions.map((session) => session.stop()),
+        );
+      }
     }
   }
 
@@ -988,26 +1162,7 @@ class ComparisonRunner {
       }
       return target;
     });
-    await Promise.all(
-      targets.map((target, targetIndex) =>
-        this.processes.run(
-          CDP_SCRIPT,
-          this.focusArgs(target.id),
-          { label: `prepare visible target ${targetIndex}` },
-        ),
-      ),
-    );
     return targets;
-  }
-
-  focusArgs(targetId) {
-    return [
-      "focus",
-      "--target-exact",
-      targetId,
-      "--timeout",
-      String(this.cdpTimeoutMs),
-    ];
   }
 
   cdpArgs(command, targetId, extra = []) {
@@ -1144,6 +1299,75 @@ class ComparisonRunner {
     );
   }
 
+  async compareCanvasAnchors(targets, environments, roundNumber) {
+    const canvasWidth = environments[0].rect.width;
+    const canvasHeight = environments[0].rect.height;
+    const roi = {
+      x: Math.min(100, Math.max(0, canvasWidth - 1)),
+      y: Math.min(100, Math.max(0, canvasHeight - 1)),
+      width: Math.max(1, canvasWidth - 200),
+      height: Math.max(1, canvasHeight - 150),
+    };
+    const screenshots = await Promise.all(
+      targets.map((target, targetIndex) =>
+        this.browserCall(
+          target.id,
+          "Page.captureScreenshot",
+          {
+            format: "png",
+            fromSurface: true,
+            optimizeForSpeed: true,
+            clip: {
+              x: environments[targetIndex].rect.x,
+              y: environments[targetIndex].rect.y,
+              width: environments[targetIndex].rect.width,
+              height: environments[targetIndex].rect.height,
+              scale: 1,
+            },
+          },
+          `capture anchor screenshot target ${targetIndex} round ${roundNumber}`,
+        ),
+      ),
+    );
+    const comparison = compareCanvasAnchors(
+      { data: screenshots[0]?.data },
+      { data: screenshots[1]?.data },
+      { roi },
+    );
+    return {
+      valid: comparison.valid,
+      reasons: comparison.reasons,
+      comparison: comparison.comparison,
+      targets: {
+        [this.config.targets[0].name]: ComparisonRunner.anchorSummary(comparison.left),
+        [this.config.targets[1].name]: ComparisonRunner.anchorSummary(comparison.right),
+      },
+      screenshot: {
+        source: "Page.captureScreenshot canvas clip",
+        round: roundNumber,
+        roi,
+        canvasRects: environments.map((environment) => environment.rect),
+      },
+    };
+  }
+
+  async startNativeFpsOverlays(targets) {
+    const started = [];
+    try {
+      const sessions = await Promise.all(
+        targets.map(async (target) => {
+          const session = await NativeFpsOverlaySession.start(target, this.cdpTimeoutMs);
+          started.push(session);
+          return session;
+        }),
+      );
+      return sessions;
+    } catch (error) {
+      await Promise.all(started.map((session) => session.stop()));
+      throw error;
+    }
+  }
+
   async normalizeCanvasWindows(targets, initialEnvironments) {
     return Promise.all(
       targets.map((target, targetIndex) =>
@@ -1255,7 +1479,7 @@ class ComparisonRunner {
     return result.value?.result;
   }
 
-  async runSample(roundNumber, targetIndex, target, environment, environmentContract) {
+  async runSample(roundNumber, targetIndex, target, environment, environmentContract, anchorContract, fpsOverlay) {
     const sampleId = `round-${String(roundNumber).padStart(2, "0")}-target-${targetIndex}`;
     const basePath = path.join(this.runDirectory, sampleId);
     const capturePath = `${basePath}.json`;
@@ -1298,9 +1522,6 @@ class ComparisonRunner {
       "--trace-output",
       tracePath,
     ];
-    if (sample.showFpsCounter) {
-      args.push("--show-fps-counter", "--fps-counter-hold", String(sample.fpsCounterHoldMs));
-    }
     if (sample.skipMidpointScreenshot) args.push("--skip-midpoint-screenshot");
     if (this.config.targets[targetIndex].legacyMousewheelBridge) {
       args.push("--legacy-mousewheel-bridge");
@@ -1342,6 +1563,8 @@ class ComparisonRunner {
       targetUrl: target.url,
       environment,
       environmentContract,
+      anchorContract,
+      fpsOverlay: fpsOverlay?.describe() ?? null,
       capture,
       analyzed,
       captureExitCode: captureProcess.exitCode,
@@ -1378,7 +1601,7 @@ class ComparisonRunner {
     const { capture, analyzed } = input;
     const wheelContract = ComparisonRunner.value(capture, "diagnostics", "wheelContract") || {};
     const invalidReasons = [];
-    if (capture.valid !== true) {
+      if (capture.valid !== true) {
       invalidReasons.push(...(capture.invalidReasons || []).map((reason) => `capture: ${reason}`));
     }
     if (analyzed.performanceKpi?.valid !== true) {
@@ -1386,6 +1609,11 @@ class ComparisonRunner {
     }
     if (capture.trace?.completeness?.valid !== true) invalidReasons.push("capture: trace completeness is invalid.");
     if (analyzed.traceIntegrity?.valid !== true) invalidReasons.push("analysis: trace integrity is invalid.");
+    const captureReceivedEventCount = capture.diagnostics?.receivedEventCount ?? null;
+    const captureExpectedEventCount = capture.diagnostics?.expectedEventCount ?? capture.input?.count ?? null;
+    if (captureReceivedEventCount !== null && captureExpectedEventCount !== null && captureReceivedEventCount !== captureExpectedEventCount) {
+      invalidReasons.push(`capture: DOM wheel event count mismatch expected=${captureExpectedEventCount} actual=${captureReceivedEventCount}.`);
+    }
     const inputAckCount = capture.input?.dispatchAcks ?? null;
     const inputReceivedCount = capture.diagnostics?.receivedEventCount ?? null;
     const coalescedEventCount = wheelContract.coalescedEventCount ?? null;
@@ -1419,7 +1647,9 @@ class ComparisonRunner {
       environment: {
         actual: input.environment,
         comparisonContract: input.environmentContract,
+        anchorContract: input.anchorContract,
       },
+      fpsOverlay: input.fpsOverlay,
       input: {
         ack: {
           expected: capture.input?.count ?? null,
@@ -1453,6 +1683,16 @@ class ComparisonRunner {
       },
       pageErrors: capture.diagnostics?.pageErrors || [],
       metrics,
+    };
+  }
+
+  static anchorSummary(anchor) {
+    return {
+      canvasSize: anchor.canvasSize,
+      roi: anchor.roi,
+      maskCount: anchor.maskCount,
+      bbox: anchor.bbox,
+      centroid: anchor.centroid,
     };
   }
 }

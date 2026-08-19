@@ -1,9 +1,6 @@
 #!/usr/bin/env node
 
 import process from "node:process";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9333;
@@ -126,39 +123,53 @@ function connect(webSocketUrl, timeoutMs) {
   });
 }
 
-function focusTarget(targetId, timeoutMs) {
-  const cdpPath = fileURLToPath(new URL("./cdp.mjs", import.meta.url));
-  const result = spawnSync(
-    process.execPath,
-    [
-      cdpPath,
-      "focus",
-      "--target-exact",
-      targetId,
-      "--allow-window-focus",
-      "--timeout",
-      String(timeoutMs),
-    ],
-    { encoding: "utf8" },
-  );
-  if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || "Could not focus target window");
-  }
-  return result.stdout.trim();
-}
-
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function waitUntilInterrupted() {
-  await new Promise((resolve) => {
-    process.once("SIGINT", resolve);
-    process.once("SIGTERM", resolve);
+async function waitForStop(input = process.stdin, signalEmitter = process) {
+  return new Promise((resolve) => {
+    let pending = "";
+
+    const finish = (reason) => {
+      input.off("data", onData);
+      input.off("end", onEnd);
+      input.off("error", onError);
+      signalEmitter.off("SIGINT", onInterrupt);
+      signalEmitter.off("SIGTERM", onTerminate);
+      resolve(reason);
+    };
+    const onData = (chunk) => {
+      pending += String(chunk);
+      if (pending.trim().toLowerCase() === "stop") {
+        finish("stdin-stop");
+        return;
+      }
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop();
+      if (lines.some((line) => line.trim().toLowerCase() === "stop")) {
+        finish("stdin-stop");
+      }
+    };
+    const onEnd = () => finish("stdin-eof");
+    const onError = () => finish("stdin-error");
+    const onInterrupt = () => finish("sigint");
+    const onTerminate = () => finish("sigterm");
+
+    input.setEncoding("utf8");
+    input.on("data", onData);
+    input.once("end", onEnd);
+    input.once("error", onError);
+    signalEmitter.once("SIGINT", onInterrupt);
+    signalEmitter.once("SIGTERM", onTerminate);
+    input.resume();
   });
 }
 
 async function main(options) {
+  if (options["until-stop"] !== undefined && options["until-stop"] !== true) {
+    throw new Error("--until-stop does not accept a value; write stop followed by a newline to stdin.");
+  }
   const timeoutMs = integerOption(
     options,
     "timeout",
@@ -174,17 +185,15 @@ async function main(options) {
     4 * 60 * 60 * 1000,
   );
   const { target } = await selectTarget(options);
-  const focus = options.focus === true;
-  const focusResult = focus ? focusTarget(target.id, timeoutMs) : null;
+  const focusRequested = options.focus === true;
   const session = await connect(target.webSocketDebuggerUrl, timeoutMs);
-  let enabled = false;
   try {
     await session.send("DOM.enable");
     await session.send("Overlay.enable");
     await session.send("Overlay.setShowFPSCounter", { show: true });
-    enabled = true;
     process.stdout.write(
       `${JSON.stringify({
+        event: "ready",
         target: {
           id: target.id,
           title: target.title,
@@ -197,26 +206,44 @@ async function main(options) {
           durationMilliseconds: options["until-stop"]
             ? null
             : durationMs,
-          focusRequested: focus,
-          focusResult,
+          untilStop: options["until-stop"] === true,
+          stopProtocol: options["until-stop"]
+            ? "Write stop to stdin; a trailing newline is optional."
+            : null,
+          focusRequested,
+          focusApplied: false,
           numericValueReturnedByCdp: false,
         },
       })}\n`,
     );
-    if (options["until-stop"] === true) await waitUntilInterrupted();
+    if (options["until-stop"] === true) await waitForStop();
     else await sleep(durationMs);
   } finally {
-    if (enabled) {
-      try {
-        await session.send("Overlay.setShowFPSCounter", { show: false });
-      } catch {}
-    }
+    try {
+      await session.send("Overlay.setShowFPSCounter", { show: false });
+    } catch {}
     session.close();
   }
 }
 
+async function runSelfTest() {
+  const parsed = parseArgs(["--target-exact", "page-1", "--until-stop"]);
+  if (parsed["target-exact"] !== "page-1" || parsed["until-stop"] !== true) {
+    throw new Error("parseArgs self-test failed");
+  }
+
+  const { PassThrough } = await import("node:stream");
+  const input = new PassThrough();
+  const signals = new PassThrough();
+  const stopped = waitForStop(input, signals);
+  input.write("stop\n");
+  const reason = await stopped;
+  if (reason !== "stdin-stop") throw new Error("stdin stop self-test failed");
+}
+
 const options = parseArgs(process.argv.slice(2));
-Promise.resolve(main(options)).then(
+const command = options["self-test"] === true ? runSelfTest() : main(options);
+Promise.resolve(command).then(
   () => process.exit(0),
   (error) => {
     process.stderr.write(`${error.stack || error.message || error}\n`);

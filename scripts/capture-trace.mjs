@@ -2,6 +2,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { acquireTraceLock } from "./trace-lock.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9333;
@@ -243,7 +244,7 @@ async function main() {
     throw new Error("Trace capture requires --output <trace.json>.");
   }
   const categories = String(options.categories || DEFAULT_CATEGORIES.join(","));
-  const { target } = await selectTarget(options);
+  const { target, host, port } = await selectTarget(options);
   const session = await connect(target.webSocketDebuggerUrl, timeoutMs);
   const collectedEvents = [];
   session.onEvent("Tracing.dataCollected", (params) => {
@@ -251,9 +252,16 @@ async function main() {
   });
   let tracingStarted = false;
   let traceCompletePromise = null;
+  let traceLock = null;
   const startedAt = Date.now();
   try {
     const page = await evaluatePage(session);
+    traceLock = await acquireTraceLock({
+      host,
+      port,
+      timeoutMs,
+      metadata: { script: "capture-trace", targetId: target.id },
+    });
     const startResult = await session.send("Tracing.start", {
       categories,
       options: "record-until-full",
@@ -279,6 +287,8 @@ async function main() {
     } else {
       traceText = traceTextFromCollected(collectedEvents);
     }
+    await traceLock.release();
+    traceLock = null;
     const parsed = JSON.parse(traceText);
     const normalized = Array.isArray(parsed)
       ? { traceEvents: parsed }
@@ -317,6 +327,11 @@ async function main() {
     if (tracingStarted) {
       try {
         await session.send("Tracing.end");
+      } catch {}
+    }
+    if (traceLock) {
+      try {
+        await traceLock.release();
       } catch {}
     }
     session.close();
