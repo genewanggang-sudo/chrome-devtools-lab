@@ -14,17 +14,36 @@ The CDP endpoint is loopback-only by default. Do not expose it on a LAN or publi
 
 ## Install From GitHub
 
-Clone the repository into the default personal plugin source directory:
+This repository is also a portable Codex marketplace. Register it, then
+install the plugin:
 
 ```powershell
-$pluginPath = Join-Path $env:USERPROFILE "plugins\chrome-devtools-lab"
-git clone https://github.com/genewanggang-sudo/chrome-devtools-lab.git $pluginPath
-codex plugin add chrome-devtools-lab@personal
+codex plugin marketplace add genewanggang-sudo/chrome-devtools-lab --ref main
+codex plugin add chrome-devtools-lab@chrome-devtools-lab
 ```
 
-The `personal` marketplace entry must resolve `./plugins/chrome-devtools-lab` to the clone path. On a new Codex installation, add this local source to the personal marketplace first, then run the install command above. The repository is intentionally a standalone plugin source; it does not contain machine-specific credentials or browser profiles.
+For a private fork, replace `genewanggang-sudo/chrome-devtools-lab` with the
+fork owner and repository. `--ref main` keeps the marketplace on the main
+branch; pin a release tag or commit SHA when a fixed version is required.
 
-After changing the local source, reinstall it with `codex plugin add chrome-devtools-lab@personal` and start a new Codex task so the new MCP tools and skills are loaded.
+Verify the installation:
+
+```powershell
+codex plugin marketplace list
+codex plugin list
+```
+
+Start a new Codex task after installation or upgrade. Existing tasks do not
+hot-load plugin skills or MCP tools. To update an existing installation, run:
+
+```powershell
+codex plugin marketplace upgrade chrome-devtools-lab
+codex plugin add chrome-devtools-lab@chrome-devtools-lab
+```
+
+The repository contains no machine-specific credentials, browser profiles, or
+local source paths. A normal `git clone` is useful for development, but by
+itself it does not install the plugin into Codex.
 
 ## Configured Wheel Comparison
 
