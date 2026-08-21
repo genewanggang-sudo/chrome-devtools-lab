@@ -2,6 +2,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   analyzeCompositorFps,
   collectCompositorSwapEvents,
@@ -340,9 +341,6 @@ function assessTraceIntegrity(payload, events, captureResult) {
       "capture-result-missing:Tracing.tracingComplete and live buffer usage are unproven",
     );
   } else {
-    if (captureResult.valid !== true) {
-      invalidReasons.push("capture-contract-invalid:sidecar valid is not true");
-    }
     if (!isObject(captureCompleteness)) {
       invalidReasons.push("capture-completeness-missing");
     } else {
@@ -723,10 +721,20 @@ function analyzeTrace(
     requestedWindow,
     presentationTargetCorrelation,
   );
-  const invalidReasons = [
+  const captureContractInvalidReasons =
+    isObject(captureResult) && captureResult.valid !== true
+      ? ["capture-contract-invalid:sidecar valid is not true"]
+      : [];
+  const presentationEvidenceInvalidReasons = [
     ...traceIntegrity.invalidReasons,
     ...windowInvalidReasons,
     ...presentationAssessment.invalidReasons,
+  ];
+  const presentationEvidenceValid =
+    presentationEvidenceInvalidReasons.length === 0;
+  const invalidReasons = [
+    ...captureContractInvalidReasons,
+    ...presentationEvidenceInvalidReasons,
   ];
   const performanceKpiValid = invalidReasons.length === 0;
   return {
@@ -749,6 +757,8 @@ function analyzeTrace(
     traceIntegrity,
     evidence: {
       presentation: {
+        valid: presentationEvidenceValid,
+        invalidReasons: presentationEvidenceInvalidReasons,
         sourceEventNames:
           presentationCandidates.length > 0 ? [PRESENTATION_EVENT_NAME] : [],
         candidateEventCount: presentationCandidates.length,
@@ -806,6 +816,8 @@ function analyzeTrace(
       compositor: compositorFrameRate,
       presentation: {
         valid: performanceKpiValid,
+        evidenceValid: presentationEvidenceValid,
+        evidenceInvalidReasons: presentationEvidenceInvalidReasons,
         fps: performanceKpiValid ? presentation.averageFps : null,
         source: "Display::FrameDisplayed",
         isFinalDisplayPresentFps: true,
@@ -894,7 +906,15 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error.message || error}\n`);
-  process.exitCode = 1;
-});
+export { analyzeTrace };
+
+const isDirectExecution =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isDirectExecution) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error.message || error}\n`);
+    process.exitCode = 1;
+  });
+}

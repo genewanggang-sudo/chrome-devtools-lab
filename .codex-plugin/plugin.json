@@ -1,6 +1,6 @@
 {
   "name": "chrome-devtools-lab",
-  "version": "0.1.0+codex.20260819010534",
+  "version": "0.1.0+codex.20260820160601",
   "description": "A maintainable Chrome browser testing, debugging, control, and performance-analysis toolkit.",
   "author": {
     "name": "Gene Wang",

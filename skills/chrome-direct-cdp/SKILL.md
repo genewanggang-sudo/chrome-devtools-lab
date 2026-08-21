@@ -68,6 +68,14 @@ delivery, coordinates and deltas, page scroll state, visual-anchor change, and
 interaction-time screencast evidence. It deliberately reports
 `performanceKpi.valid=false`: rAF and screencast are not GPU Present FPS.
 
+For a repeatable two-target comparison, use `compare-wheel.mjs --config` with
+an application-owned scenario JSON. Its `windows-native` backend uses verified
+Windows wheel input against the exact foreground
+`Chrome_RenderWidgetHostHWND`, then records whether each page received native
+`wheel`, browser-generated legacy `mousewheel`, or an explicitly configured
+compatibility relay. Because Windows routes wheel input to the foreground
+window, the two targets are sampled sequentially.
+
 ## Performance evidence
 
 For a saved trace, use:
@@ -79,9 +87,11 @@ node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\analyze-trace.mjs" `
   --input "$env:TEMP\trace.json" --output "$env:TEMP\trace-summary.json"
 ```
 
-Only a trace with explicit compositor/presentation evidence can support a
-presentation-rate KPI. Keep tracing, CPU profiling, draw-call instrumentation,
-and WPR/GPUView captures separate from the final FPS sample.
+Only a trace with explicit target-correlated compositor and
+`Display::FrameDisplayed` evidence can support a browser presentation-rate
+KPI. This is not the same as an independent DWM/monitor measurement. Keep CPU
+profiling, draw-call instrumentation, and WPR/GPUView captures separate from
+the frame-rate sample.
 
 See `references/direct-cdp-contract.md` for lifecycle, background, cleanup,
 and invalid-sample rules.

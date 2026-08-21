@@ -17,16 +17,18 @@ Keep these layers separate:
 | Input            | direct CDP `wheel-probe`, `pointer`        | exact target, native CDP event, trusted delivery                 |
 | Page diagnostics | MCP console/network/snapshot               | page state, errors, requests, DOM/UI state                       |
 | CPU              | MCP performance tools or a V8 profile      | JavaScript and renderer CPU attribution                          |
-| Trace            | `capture-trace.mjs` + `analyze-trace.mjs`  | compositor, renderer, GPU, frame and present events when present |
+| Trace            | `capture-trace.mjs` + `analyze-trace.mjs`  | compositor work and target-correlated browser display cadence    |
 | System GPU       | WPR/GPUView                                | queue, GPU scheduling, Present/DWM attribution                   |
 | WebGL work       | app instrumentation or a graphics debugger | draw calls, passes, state changes, GPU workload                  |
 
 Do not call rAF FPS, screencast FPS, draw-call count, or GPU utilization by
-itself "real FPS". The plugin reports two explicit frame-rate layers:
+itself "real FPS". The plugin reports separate frame-rate layers:
 `frameRate.compositor` from Chrome's `Graphics.Pipeline` /
-`STEP_DRAW_AND_SWAP`, and final display FPS from the optional PresentMon
-backend. Keep those values separate; compositor FPS is not DWM/monitor Present
-FPS.
+`STEP_DRAW_AND_SWAP`, target-correlated browser presentation cadence from
+`Display::FrameDisplayed`, and optional Windows ETW/DWM data from PresentMon.
+Keep those values separate; browser presentation cadence is the numeric Chrome
+trace counterpart to the DevTools FPS workflow, but it is not an independent
+physical-monitor measurement.
 
 ## Test contract
 
@@ -50,6 +52,32 @@ an instruction to run the FPS workflow. Enable Chrome's native DevTools FPS
 counter with `--show-fps-counter` during the interaction unless the user
 explicitly disables the visible overlay. Keep the same overlay state on every
 compared target.
+
+For a repeatable two-target comparison, place exact URLs, readiness checks,
+setup actions, and the sample contract in an application-owned scenario JSON:
+
+```powershell
+node scripts/compare-wheel.mjs --config <absolute-scenario.json> --output-dir <evidence-dir>
+```
+
+The plugin contains no site presets, URL heuristics, menu selectors, or loader
+logic. The scenario must explicitly select `windows-native` when the physical
+Windows wheel path is required and must define any application readiness beyond
+a visible Canvas. Windows routes this input to the foreground render widget,
+so targets are activated and sampled sequentially. The plugin locks the cursor
+only for each measurement window and restores the previous clipping range.
+
+After a strict run has refreshed and aligned both targets, a single rapid
+follow-up can use `--reuse-ready-state`. It rebinds exact targets and repeats
+visible-surface, canvas/DPR, and paired-anchor gates, but skips reload/resize.
+It is explicitly a prepared-state sample, not a fresh-reload comparison; it
+cannot retry after input because wheel interaction can change the camera state.
+
+If its minimal FPS trace lacks complete target-correlated display evidence,
+the runner preserves the input and visual sample but marks the browser
+presentation metric invalid. It neither repeats a slow full trace implicitly
+nor fills the gap with rAF or the visual overlay value. Run an explicit full
+trace profile only after reading the recorded failure reason.
 
 Use `--skip-midpoint-screenshot` for numeric trace samples so
 `Page.captureScreenshot` cannot stall the measured wheel window. Run visual
@@ -84,6 +112,7 @@ samples that violate any part of the contract instead of averaging them in.
   node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\wheel-benchmark.mjs" `
     --target-exact "TARGET_ID" --x 768 --y 504 --count 120 `
     --duration 2000 --delta-y 40 `
+    --input-backend windows-native --legacy-mousewheel-bridge `
     --show-fps-counter --fps-counter-hold 10000 `
     --skip-midpoint-screenshot `
     --expected-dpr 1 --expected-viewport-width 1192 `
@@ -104,9 +133,9 @@ samples that violate any part of the contract instead of averaging them in.
   records that it was enabled and keeps its trace-derived numeric metrics
   separate.
 
-  The expected DPR, viewport, and canvas rectangle are required. Use the
-  Onshape page coordinates and viewport values for the reference target; do
-  not reuse the local values. Analyze the saved trace separately and pass the
+  The expected DPR, viewport, and canvas rectangle are required. Use each
+  target's own page coordinates and viewport values; do not reuse another
+  target's page origin. Analyze the saved trace separately and pass the
   combined sample as the capture sidecar. The analyzer automatically uses
   `capture-result.trace.frameRateWindow`; explicit `--window-start-us` and
   `--window-end-us` still take precedence.
@@ -120,7 +149,9 @@ samples that violate any part of the contract instead of averaging them in.
     --output "$env:TEMP\chrome-trace-summary.json"
    ```
 
-   For a final display-rate sample around the same wheel operation:
+   The analyzed trace reports `Display::FrameDisplayed` only when the event
+   density, trace integrity, and target correlation gates pass. For an optional
+   independent Windows ETW/DWM cross-check around the same wheel operation:
 
    ```powershell
    node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\present-fps.mjs" wheel `
@@ -131,9 +162,10 @@ samples that violate any part of the contract instead of averaging them in.
      --expected-canvas-width 1192 --expected-canvas-height 1028
    ```
 
-   This command requires Windows Performance Log Users/admin access. A
-   permission failure is a blocked final-display KPI, not a substitute for
-   rAF or compositor cadence.
+   This optional command requires Windows Performance Log Users/admin access.
+   A permission failure blocks only the independent system-level cross-check;
+   it does not invalidate already qualified Chrome trace presentation data and
+   is never replaced with rAF or compositor cadence.
 
 5. Inspect top long tasks, compositor/GPU event counts, frame interval
    distribution, and missing evidence. Only then choose a code path to inspect.

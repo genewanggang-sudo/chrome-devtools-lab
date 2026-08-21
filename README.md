@@ -7,7 +7,8 @@ Chrome browser control and performance evidence tooling for Codex. The plugin co
 - Codex Desktop or Codex CLI with plugin support.
 - Node.js supported by `chrome-devtools-mcp@1.7.0`: `^20.19.0`, `^22.12.0`, or `>=23`.
 - Google Chrome started with a dedicated remote-debugging endpoint at `http://127.0.0.1:9333`.
-- Windows PowerShell for the dedicated Chrome lifecycle and optional PresentMon backend.
+- Windows PowerShell for the dedicated Chrome lifecycle, foreground native-wheel
+  input, and the optional PresentMon backend.
 
 The CDP endpoint is loopback-only by default. Do not expose it on a LAN or public interface; a CDP endpoint provides access to page contents, cookies, scripts, and input.
 
@@ -25,9 +26,11 @@ The `personal` marketplace entry must resolve `./plugins/chrome-devtools-lab` to
 
 After changing the local source, reinstall it with `codex plugin add chrome-devtools-lab@personal` and start a new Codex task so the new MCP tools and skills are loaded.
 
-## Fast Wheel Comparison
+## Configured Wheel Comparison
 
-Create a scenario JSON with two targets identified by their exact URLs, then run:
+`compare-wheel.mjs` is application-neutral. Create a scenario JSON outside the
+plugin with two exact target URLs plus any application-specific readiness and
+setup actions, then run:
 
 ```powershell
 node scripts/compare-wheel.mjs `
@@ -35,11 +38,49 @@ node scripts/compare-wheel.mjs `
   --output-dir C:\path\to\wheel-results
 ```
 
-The runner re-discovers exact targets for every round, restores minimized target windows through `Target.activateTarget` without Windows foreground activation, reloads both pages, waits for the configured setup condition, checks canvas/DPR/drawing-buffer parity, and alternates sample order across rounds. Every run receives a unique output directory and existing evidence is not overwritten.
+The plugin does not ship site presets, URL heuristics, menu selectors, model
+names, or application loaders. Keep those details in the calling project's
+scenario file. The runner validates the JSON before touching Chrome and writes
+the resolved config into every run contract.
+
+The runner re-discovers exact targets for every round, reloads both pages,
+waits for the configured setup condition, normalizes existing Chrome window
+bounds through verified Win32 placement when needed, checks
+canvas/DPR/drawing-buffer parity, and alternates sample order across rounds.
+Native Windows wheel input is delivered to the foreground render widget, so
+the targets are activated and sampled sequentially; they cannot receive native
+wheel input simultaneously.
+The cursor is locked to the verified canvas point only during each measurement
+window and its previous Windows clipping range is restored afterward, including
+on failure.
+The runner does not call `Page.bringToFront`. Every run receives a unique
+output directory and existing evidence is not overwritten.
+
+Use `--prepare-only` with any scenario for a fresh reload/setup/alignment gate
+that sends no wheel input and starts no FPS or trace instrumentation. Use
+`--rounds` and `--max-input-retries` to override the corresponding JSON values.
+
+When two visible windows have already been refreshed and aligned, use
+`--reuse-ready-state` only with a scenario whose setup action arrays are empty:
+
+```powershell
+node scripts/compare-wheel.mjs `
+  --config C:\path\to\prepared-wheel-scenario.json `
+  --reuse-ready-state `
+  --output-dir C:\path\to\wheel-results
+```
+
+This path skips reload, setup actions, and window resizing, but still performs
+exact-target discovery, visible-surface checks, canvas/DPR parity, and the
+paired camera/model anchor gate. It accepts exactly one round and does not
+retry after wheel or trace failure because the sample itself may change the
+camera state. Its evidence is labeled `prepared-state`, not equivalent to a
+fresh-reload run. Refresh and align both windows again before starting another
+prepared-state sample.
 
 ## Evidence Layers
 
-- `scripts/wheel-benchmark.mjs` dispatches trusted `Input.dispatchMouseEvent` wheel input and records input delivery, visual change, rAF diagnostics, Chrome trace data, and optional DevTools FPS overlay state.
+- `scripts/wheel-benchmark.mjs` supports trusted CDP wheel input and verified Windows `SendInput` wheel input. Configured comparisons record input delivery, visual change, rAF diagnostics, Chrome trace data, and DevTools FPS overlay state.
 - `scripts/analyze-trace.mjs` reports validated `Display::FrameDisplayed` cadence and Chrome compositor `STEP_DRAW_AND_SWAP` cadence. The former is the strongest browser trace presentation signal available here; it is not a DWM monitor Present measurement.
 - rAF and screencast rates are diagnostics. They must not be reported as GPU FPS.
 - The DevTools FPS overlay is visible only while the target has a visible display surface. CDP can enable it but does not return the overlay's numeric value.
@@ -62,8 +103,10 @@ Always list targets immediately before a run and bind the exact current target I
 ## Validation
 
 ```powershell
-node --check scripts/*.mjs
+Get-ChildItem scripts\*.mjs | ForEach-Object { node --check $_.FullName }
 node scripts/cdp.mjs self-check
+node scripts/wheel-sequence.mjs --self-test
+node scripts/wheel-benchmark.mjs --self-test
 node scripts/compare-wheel.mjs --self-test
 ```
 

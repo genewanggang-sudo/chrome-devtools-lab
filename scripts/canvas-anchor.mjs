@@ -15,6 +15,7 @@ const DEFAULT_MASK_OPTIONS = Object.freeze({
     saturationValueMin: 0.25,
     edgeContrastMin: 24,
 });
+const FALLBACK_DARK_LUMA_MAX = 100;
 const DEFAULT_COMPARE_OPTIONS = Object.freeze({
     bboxTolerancePx: 2,
     centroidTolerancePx: 2,
@@ -172,7 +173,7 @@ export function compareCanvasAnchors(leftSource, rightSource, options = {}) {
     if (maskCountRelativeDelta > compareOptions.maskCountRelativeTolerance) {
         reasons.push(`mask-count relative delta ${(maskCountRelativeDelta * 100).toFixed(2)}% exceeds ${(compareOptions.maskCountRelativeTolerance * 100).toFixed(2)}% (left=${left.maskCount}, right=${right.maskCount}).`);
     }
-    return {
+    const result = {
         valid: reasons.length === 0,
         reasons,
         left,
@@ -184,6 +185,22 @@ export function compareCanvasAnchors(leftSource, rightSource, options = {}) {
             maskCountDelta,
             maskCountRelativeDelta,
             tolerances: compareOptions,
+        },
+    };
+    if (result.valid || options.darkLumaMax !== undefined) return result;
+
+    const fallback = compareCanvasAnchors(leftSource, rightSource, {
+        ...options,
+        darkLumaMax: FALLBACK_DARK_LUMA_MAX,
+    });
+    if (!fallback.valid) return result;
+    return {
+        ...fallback,
+        maskSelection: {
+            strategy: "dark-luma-fallback",
+            selectedDarkLumaMax: FALLBACK_DARK_LUMA_MAX,
+            primaryDarkLumaMax: DEFAULT_MASK_OPTIONS.darkLumaMax,
+            primaryReasons: result.reasons,
         },
     };
 }
@@ -424,16 +441,16 @@ class CanvasAnchorSelfTestPng {
     }
 }
 
-function selfTestImage(offsetX = 0, channels = 4, columns = 4) {
+function selfTestImage(offsetX = 0, channels = 4, columns = 4, color = [10, 30, 220]) {
     const width = 12;
     const height = 10;
     const pixels = Buffer.alloc(width * height * channels, 235);
     for (let y = 3; y <= 6; y += 1) {
         for (let x = 4 + offsetX; x < 4 + offsetX + columns; x += 1) {
             const index = (y * width + x) * channels;
-            pixels[index] = 10;
-            pixels[index + 1] = 30;
-            pixels[index + 2] = 220;
+            pixels[index] = color[0];
+            pixels[index + 1] = color[1];
+            pixels[index + 2] = color[2];
             if (channels === 4) pixels[index + 3] = 255;
         }
     }
@@ -476,6 +493,12 @@ function runSelfTest() {
     assert.deepEqual(filtered.centroid, { x: 3.5, y: 3.5 });
     const similar = compareCanvasAnchors(rgba.toString("base64"), { data: rgb.toString("base64") });
     assert.equal(similar.valid, true);
+    assert.equal(similar.maskSelection, undefined);
+    const fallbackImage = selfTestImage(0, 4, 4, [90, 90, 90]);
+    const fallbackSimilar = compareCanvasAnchors(fallbackImage, fallbackImage);
+    assert.equal(fallbackSimilar.valid, true);
+    assert.equal(fallbackSimilar.maskSelection?.selectedDarkLumaMax, FALLBACK_DARK_LUMA_MAX);
+    assert.equal(compareCanvasAnchors(fallbackImage, selfTestImage(4, 4, 4, [90, 90, 90])).valid, false);
     const shifted = compareCanvasAnchors(rgba, selfTestImage(4, 4));
     assert.equal(shifted.valid, false);
     assert.match(shifted.reasons.join("\n"), /bbox delta exceeds/);

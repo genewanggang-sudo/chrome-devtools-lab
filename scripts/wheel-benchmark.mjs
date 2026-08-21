@@ -4,13 +4,20 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import {
   analyzeCompositorFps,
   findTraceWindow,
 } from "./frame-rate.mjs";
+import { analyzeTrace } from "./analyze-trace.mjs";
 import { acquireTraceLock } from "./trace-lock.mjs";
+import { runPowerShellNativeWheel } from "./windows-native-wheel.mjs";
+import { buildHumanWheelSequence } from "./wheel-sequence.mjs";
 
+const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
+const CDP_SCRIPT = path.join(SCRIPT_DIRECTORY, "cdp.mjs");
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9333;
 const DEFAULT_COUNT = 120;
@@ -20,24 +27,62 @@ const DEFAULT_POST_FRAMES = 12;
 const DEFAULT_TIMEOUT_MS = 60000;
 const TRACE_STREAM_CHUNK_BYTES = 1024 * 1024;
 const POINTER_SETTLE_MS = 100;
-const TRACE_CATEGORIES = [
-  "-*",
-  "benchmark",
-  "cc",
-  "disabled-by-default-devtools.timeline",
-  "disabled-by-default-display.framedisplayed",
-  "disabled-by-default-gpu.service",
-  "gpu",
-  "input",
-  "viz",
-  "blink.user_timing",
-].join(",");
+const WHEEL_DELIVERY_WAIT_MAX_MS = 500;
+const MAX_IN_FLIGHT_WHEEL_DISPATCHES = 128;
+const NATIVE_WHEEL_DELTA_TO_DOM_SCALE = 10 / 9;
+const WHEEL_DELTA_EPSILON = 0.01;
+const TRACE_PROFILES = Object.freeze({
+  none: null,
+  fps: [
+    "-*",
+    "benchmark",
+    "cc",
+    "disabled-by-default-devtools.timeline",
+    "viz",
+    "disabled-by-default-display.framedisplayed",
+    "blink.user_timing",
+  ].join(","),
+  "fps-minimal": [
+    "-*",
+    "benchmark",
+    "disabled-by-default-devtools.timeline",
+    "disabled-by-default-display.framedisplayed",
+    "viz",
+    "blink.user_timing",
+  ].join(","),
+  full: [
+    "-*",
+    "benchmark",
+    "cc",
+    "disabled-by-default-devtools.timeline",
+    "disabled-by-default-display.framedisplayed",
+    "disabled-by-default-gpu.service",
+    "gpu",
+    "input",
+    "viz",
+    "blink.user_timing",
+  ].join(","),
+  quick: [
+    "-*",
+    "benchmark",
+    "cc",
+    "disabled-by-default-devtools.timeline",
+    "disabled-by-default-display.framedisplayed",
+    "disabled-by-default-gpu.service",
+    "input",
+    "viz",
+    "blink.user_timing",
+  ].join(","),
+});
 const TRACE_WHEEL_START_MARKER = "ChromeDevToolsLab.WheelStart";
 const TRACE_WHEEL_END_MARKER = "ChromeDevToolsLab.WheelEnd";
 const NATIVE_FPS_COUNTER_SOURCE =
   "Chrome DevTools Overlay.setShowFPSCounter";
 const LEGACY_MOUSEWHEEL_BRIDGE_SOURCE =
   "temporary legacy mousewheel compatibility relay";
+const INPUT_DELIVERY_POLICIES = new Set(["strict", "diagnostic"]);
+const SOFT_INPUT_CAPTURE_REASON =
+  /^(dom-wheel-event-count-mismatch|dom-wheel-delta-y-sequence-mismatch|legacy-wheel-handler-count-mismatch|dom-wheel-timing-out-of-contract):/;
 
 function parseArgs(argv) {
   const options = {};
@@ -126,6 +171,55 @@ function parseExpectedEnvironmentContract(options) {
   };
 }
 
+function parsePostFocusWindowPlacement(options, inputBackend) {
+  const optionNames = [
+    "post-focus-window-left",
+    "post-focus-window-top",
+    "post-focus-window-width",
+    "post-focus-window-height",
+  ];
+  const supplied = optionNames.filter(
+    (name) => options[name] !== undefined && options[name] !== true,
+  );
+  if (supplied.length === 0) return null;
+  if (supplied.length !== optionNames.length) {
+    throw new Error(
+      `Post-focus window placement requires all of ${optionNames.map((name) => `--${name}`).join(", ")}.`,
+    );
+  }
+  if (inputBackend !== "windows-native") {
+    throw new Error(
+      "Post-focus window placement is only valid with --input-backend windows-native.",
+    );
+  }
+  return {
+    left: requiredIntegerOption(
+      options,
+      "post-focus-window-left",
+      -32768,
+      32767,
+    ),
+    top: requiredIntegerOption(
+      options,
+      "post-focus-window-top",
+      -32768,
+      32767,
+    ),
+    width: requiredIntegerOption(
+      options,
+      "post-focus-window-width",
+      200,
+      32768,
+    ),
+    height: requiredIntegerOption(
+      options,
+      "post-focus-window-height",
+      200,
+      32768,
+    ),
+  };
+}
+
 async function getJson(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`);
@@ -139,6 +233,24 @@ async function selectTarget(options) {
   if (typeof selector !== "string" || selector.length === 0) {
     throw new Error("Wheel benchmark requires --target-exact <target ID>.");
   }
+  const suppliedWebSocketUrl = options["target-websocket-url"];
+  if (typeof suppliedWebSocketUrl === "string" && suppliedWebSocketUrl.length > 0) {
+    if (!/^ws:\/\//i.test(suppliedWebSocketUrl)) {
+      throw new Error("--target-websocket-url must be a ws:// URL.");
+    }
+    return {
+      target: {
+        type: "page",
+        id: selector,
+        title: null,
+        url: null,
+        webSocketDebuggerUrl: suppliedWebSocketUrl,
+      },
+      host,
+      port,
+      targetResolution: "caller-supplied-exact-websocket",
+    };
+  }
   const targets = await getJson(`http://${host}:${port}/json/list`);
   const target = targets.find(
     (candidate) => candidate.type === "page" && candidate.id === selector,
@@ -147,7 +259,7 @@ async function selectTarget(options) {
   if (typeof target.webSocketDebuggerUrl !== "string") {
     throw new Error(`Target has no page WebSocket: ${selector}`);
   }
-  return { target, host, port };
+  return { target, host, port, targetResolution: "cdp-json-list" };
 }
 
 function connect(webSocketUrl, timeoutMs) {
@@ -305,7 +417,12 @@ async function captureCanvasHash(session, canvas) {
     .digest("hex");
 }
 
-async function installProbe(session, useLegacyMousewheelBridge) {
+async function installProbe(
+  session,
+  useLegacyMousewheelBridge,
+  point,
+  traceMarkersEnabled,
+) {
   return evaluate(
     session,
     `(() => {
@@ -315,9 +432,22 @@ async function installProbe(session, useLegacyMousewheelBridge) {
         .sort((left, right) => right.rect.width * right.rect.height - left.rect.width * left.rect.height);
       const candidate = canvases[0];
       if (!candidate) throw new Error("No visible canvas is available");
+      const inputTarget = document.elementFromPoint(
+        ${JSON.stringify(point.x)},
+        ${JSON.stringify(point.y)},
+      );
+      if (inputTarget !== candidate.canvas) {
+        const targetDescription = inputTarget
+          ? [inputTarget.tagName, inputTarget.id && "#" + inputTarget.id, inputTarget.className && "." + String(inputTarget.className).trim().split(" ").filter(Boolean).join(".")]
+              .filter(Boolean)
+              .join("")
+          : "null";
+        throw new Error("Wheel input point is blocked; expected the largest canvas but elementFromPoint resolved " + targetDescription + ".");
+      }
       const state = {
         wheelEvents: [],
         legacyMousewheelEvents: [],
+        relayedLegacyEvents: new WeakSet(),
         rafTimestamps: [],
         longTasks: [],
         pageErrors: [],
@@ -334,6 +464,10 @@ async function installProbe(session, useLegacyMousewheelBridge) {
       };
       state.onWheel = (event) => {
         const now = performance.now();
+        if (${traceMarkersEnabled ? "true" : "false"} && state.wheelEvents.length === 0) {
+          performance.mark(${JSON.stringify(TRACE_WHEEL_START_MARKER)});
+          console.timeStamp(${JSON.stringify(TRACE_WHEEL_START_MARKER)});
+        }
         state.firstInput ??= now;
         state.lastInput = now;
         state.wheelEvents.push({
@@ -361,6 +495,9 @@ async function installProbe(session, useLegacyMousewheelBridge) {
           clientY: event.clientY,
           defaultPrevented: event.defaultPrevented,
           targetTag: event.target?.tagName || null,
+          source: state.relayedLegacyEvents.has(event)
+            ? "plugin-relay"
+            : "browser",
         });
       };
       if (${useLegacyMousewheelBridge ? "true" : "false"}) {
@@ -396,6 +533,7 @@ async function installProbe(session, useLegacyMousewheelBridge) {
             wheelDeltaX: { value: -event.deltaX },
             wheelDeltaY: { value: -event.deltaY },
           });
+          state.relayedLegacyEvents.add(legacyEvent);
           candidate.canvas.dispatchEvent(legacyEvent);
           if (legacyEvent.defaultPrevented) event.preventDefault();
           state.legacyMousewheelBridge.relayEvents.push({
@@ -481,6 +619,27 @@ async function disposeProbe(session) {
   );
 }
 
+async function resetProbeForMeasurement(session) {
+  return evaluate(
+    session,
+    `(() => {
+      const probe = globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__;
+      if (!probe) throw new Error("Wheel probe is not installed");
+      const { state } = probe;
+      state.wheelEvents.length = 0;
+      state.legacyMousewheelEvents.length = 0;
+      state.rafTimestamps.length = 0;
+      state.longTasks.length = 0;
+      state.firstInput = null;
+      state.lastInput = null;
+      if (state.legacyMousewheelBridge) {
+        state.legacyMousewheelBridge.relayEvents.length = 0;
+      }
+      return { resetAt: performance.now() };
+    })()`,
+  );
+}
+
 async function readTraceStream(session, handle) {
   const chunks = [];
   let eof = false;
@@ -504,6 +663,46 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function waitForProbeWheelDelivery(session, expectedCount, timeoutMs) {
+  const startedAt = performance.now();
+  const result = await evaluate(
+    session,
+    `(() => new Promise((resolve) => {
+      const probe = globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__;
+      if (!probe) {
+        resolve({ available: false, expectedCount: ${expectedCount}, receivedCount: null, waitedMilliseconds: 0, timedOut: false, reason: "probe-missing" });
+        return;
+      }
+      const startedAt = performance.now();
+      const finish = (reason, timedOut) => resolve({
+        available: true,
+        expectedCount: ${expectedCount},
+        receivedCount: probe.state.wheelEvents.length,
+        waitedMilliseconds: performance.now() - startedAt,
+        timedOut,
+        reason,
+      });
+      const check = () => {
+        if (probe.state.wheelEvents.length >= ${expectedCount}) {
+          finish("expected-event-count", false);
+          return;
+        }
+        if (performance.now() - startedAt >= ${timeoutMs}) {
+          finish("delivery-timeout", true);
+          return;
+        }
+        setTimeout(check, 4);
+      };
+      check();
+    }))()`,
+  );
+  return {
+    ...result,
+    hostWaitedMilliseconds: performance.now() - startedAt,
+    timeoutMilliseconds: timeoutMs,
+  };
+}
+
 function percentile(values, fraction) {
   if (values.length === 0) return null;
   const sorted = [...values].sort((left, right) => left - right);
@@ -512,15 +711,357 @@ function percentile(values, fraction) {
   ];
 }
 
-function createExpectedWheelEvents(count, point, deltaMagnitude) {
-  return Array.from({ length: count }, (_, index) => ({
-    isTrusted: true,
-    clientX: point.x,
-    clientY: point.y,
-    deltaMode: 0,
-    deltaX: 0,
-    deltaY: index < count / 2 ? -deltaMagnitude : deltaMagnitude,
+function createExpectedWheelEvents(
+  count,
+  point,
+  deltaMagnitude,
+  durationMs,
+  seed,
+  inputBackend = "cdp",
+) {
+  return buildHumanWheelSequence({
+    count,
+    durationMs,
+    deltaMagnitude,
+    seed,
+    maximumRunLength: 10,
+    typicalBurstMaximum: 4,
+  }).map((event) => {
+    const nativeDeltaY =
+      inputBackend === "windows-native"
+        ? Math.max(1, Math.round(Math.abs(event.deltaY) / NATIVE_WHEEL_DELTA_TO_DOM_SCALE)) *
+          -Math.sign(event.deltaY)
+        : null;
+    return {
+      isTrusted: true,
+      clientX: point.x,
+      clientY: point.y,
+      deltaMode: 0,
+      deltaX: 0,
+      deltaY:
+        nativeDeltaY === null
+          ? event.deltaY
+          : -nativeDeltaY * NATIVE_WHEEL_DELTA_TO_DOM_SCALE,
+      requestedDeltaY: event.deltaY,
+      nativeDeltaY,
+      offsetMilliseconds: event.offsetMilliseconds,
+    };
+  });
+}
+
+function runJsonChild(scriptPath, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      cwd: SCRIPT_DIRECTORY,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      if (!settled) {
+        settled = true;
+        reject(new Error(`${path.basename(scriptPath)} timed out after ${timeoutMs}ms.`));
+      }
+    }, timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`${path.basename(scriptPath)} failed to start: ${error.message}`));
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`${path.basename(scriptPath)} failed with ${signal ? `signal ${signal}` : `code ${code}`}: ${(stderr || stdout).trim()}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout.trim()));
+      } catch (error) {
+        reject(new Error(`${path.basename(scriptPath)} returned invalid JSON: ${error.message}`));
+      }
+    });
+  });
+}
+
+async function focusNativeTarget(targetId, port, timeoutMs) {
+  return runJsonChild(
+    CDP_SCRIPT,
+    [
+      "focus",
+      "--target-exact",
+      targetId,
+      "--port",
+      String(port),
+      "--allow-window-focus",
+      "--no-focus-emulation",
+      "--no-page-bring-to-front",
+      "--timeout",
+      String(timeoutMs),
+    ],
+    timeoutMs,
+  );
+}
+
+async function placeNativeTargetAfterFocus(
+  targetId,
+  port,
+  timeoutMs,
+  requestedBounds,
+) {
+  return runJsonChild(
+    CDP_SCRIPT,
+    [
+      "window-place",
+      "--target-exact",
+      targetId,
+      "--port",
+      String(port),
+      "--allow-window-move",
+      "--left",
+      String(requestedBounds.left),
+      "--top",
+      String(requestedBounds.top),
+      "--width",
+      String(requestedBounds.width),
+      "--height",
+      String(requestedBounds.height),
+      "--timeout",
+      String(timeoutMs),
+    ],
+    timeoutMs,
+  );
+}
+
+function validatePostFocusPlacement(
+  placement,
+  requestedBounds,
+  resolvedFocus,
+  page,
+) {
+  if (placement?.valid !== true) {
+    throw new Error(
+      `Post-focus exact-target window placement was not valid: ${JSON.stringify(placement)}`,
+    );
+  }
+  const focusedWindowHandle = Number(
+    resolvedFocus.activation?.window?.mainWindowHandle,
+  );
+  const placedWindowHandle = Number(placement.resolution?.candidate?.handle);
+  if (
+    !Number.isSafeInteger(focusedWindowHandle) ||
+    !Number.isSafeInteger(placedWindowHandle) ||
+    focusedWindowHandle !== placedWindowHandle
+  ) {
+    throw new Error(
+      `Post-focus placement resolved a different Chrome window: focused=${focusedWindowHandle} placed=${placedWindowHandle}.`,
+    );
+  }
+  const pageReadback = placement.readback?.page;
+  const invalidReasons = [];
+  if (pageReadback?.innerWidth !== page.viewport.width) {
+    invalidReasons.push(
+      `innerWidth:expected=${page.viewport.width}:actual=${pageReadback?.innerWidth}`,
+    );
+  }
+  if (pageReadback?.innerHeight !== page.viewport.height) {
+    invalidReasons.push(
+      `innerHeight:expected=${page.viewport.height}:actual=${pageReadback?.innerHeight}`,
+    );
+  }
+  if (pageReadback?.outerWidth !== requestedBounds.width) {
+    invalidReasons.push(
+      `outerWidth:expected=${requestedBounds.width}:actual=${pageReadback?.outerWidth}`,
+    );
+  }
+  if (pageReadback?.outerHeight !== requestedBounds.height) {
+    invalidReasons.push(
+      `outerHeight:expected=${requestedBounds.height}:actual=${pageReadback?.outerHeight}`,
+    );
+  }
+  if (invalidReasons.length > 0) {
+    throw new Error(
+      `Post-focus page/window readback changed the frozen viewport contract: ${invalidReasons.join(" ")}`,
+    );
+  }
+  return {
+    requestedBounds,
+    focusedWindowHandle,
+    placedWindowHandle,
+    evidence: placement,
+  };
+}
+
+async function dispatchNativeWheelSequence({
+  target,
+  port,
+  page,
+  expectedEvents,
+  durationMs,
+  timeoutMs,
+  postFocusWindowBounds,
+}) {
+  if (process.platform !== "win32") {
+    throw new Error("Windows native wheel input is only supported on Windows.");
+  }
+  const resolvedFocus = await focusNativeTarget(target.id, port, timeoutMs);
+  const processId = Number(resolvedFocus.activation?.window?.processId);
+  if (!Number.isInteger(processId) || processId <= 0 || resolvedFocus.activation?.window?.focused !== true) {
+    throw new Error(`Dedicated Chrome window was not focused: ${JSON.stringify(resolvedFocus.activation?.window || null)}`);
+  }
+  const postFocusPlacement = postFocusWindowBounds === null
+    ? null
+    : validatePostFocusPlacement(
+        await placeNativeTargetAfterFocus(
+          target.id,
+          port,
+          timeoutMs,
+          postFocusWindowBounds,
+        ),
+        postFocusWindowBounds,
+        resolvedFocus,
+        page,
+      );
+  const nativeEvents = expectedEvents.map((event) => ({
+    offsetMilliseconds: event.offsetMilliseconds,
+    deltaY: event.nativeDeltaY ?? event.deltaY,
   }));
+  const startedAt = performance.now();
+  const native = await runPowerShellNativeWheel({
+    processId,
+    foregroundWindowHandle:
+      resolvedFocus.activation.window.mainWindowHandle,
+    viewportPoint: {
+      x: expectedEvents[0].clientX,
+      y: expectedEvents[0].clientY,
+    },
+    viewport: {
+      width: page.viewport.width,
+      height: page.viewport.height,
+      dpr: page.dpr,
+    },
+    events: nativeEvents,
+    timeoutMs: timeoutMs + durationMs,
+  });
+  const endedAt = performance.now();
+  return {
+    dispatchAcks: native.sentCount,
+    dispatchedEventCount: native.sentCount,
+    dispatchStartedAt: startedAt,
+    dispatchEndedAt: endedAt,
+    maximumDispatchScheduleErrorMilliseconds: native.maximumScheduleErrorMilliseconds,
+    maximumDispatchAckLatencyMilliseconds: null,
+    maximumInFlightObserved: 1,
+    maximumInFlightAllowed: 1,
+    dispatchErrors: native.sentCount === expectedEvents.length ? [] : [`native sent ${native.sentCount}/${expectedEvents.length} events`],
+    nativeInput: {
+      backend: "windows-SendInput",
+      processId,
+      focus: resolvedFocus,
+      postFocusPlacement,
+      screenPoint: native.screenPoint,
+      cursorLockedDuringDispatch:
+        native.cursorLockedDuringDispatch === true,
+      renderWidget: native.renderWidget,
+      foregroundWindowHandle: native.foregroundWindowHandle,
+      focusLease: native.focusLease,
+      windowDpi: native.windowDpi,
+      monitor: native.monitor,
+      sentCount: native.sentCount,
+      requestedCount: native.requestedCount,
+      elapsedMilliseconds: native.elapsedMilliseconds,
+      maximumScheduleErrorMilliseconds: native.maximumScheduleErrorMilliseconds,
+    },
+  };
+}
+
+async function dispatchWheelSequence(
+  session,
+  expectedEvents,
+  durationMs,
+  maximumInFlight = MAX_IN_FLIGHT_WHEEL_DISPATCHES,
+  onDispatchComplete = null,
+) {
+  const dispatchStartedAt = performance.now();
+  let dispatchAcks = 0;
+  let maximumDispatchScheduleErrorMilliseconds = 0;
+  let maximumDispatchAckLatencyMilliseconds = 0;
+  let maximumInFlightObserved = 0;
+  const dispatchErrors = [];
+  const pendingAcks = new Set();
+  let dispatchedEventCount = 0;
+
+  for (let index = 0; index < expectedEvents.length; index += 1) {
+    const due = dispatchStartedAt + expectedEvents[index].offsetMilliseconds;
+    const delay = due - performance.now();
+    if (delay > 0) await sleep(delay);
+    if (pendingAcks.size >= maximumInFlight) {
+      dispatchErrors.push(
+        `maximum in-flight wheel dispatches exceeded: limit=${maximumInFlight} index=${index}`,
+      );
+      break;
+    }
+    const expectedEvent = expectedEvents[index];
+    const sentAt = performance.now();
+    maximumDispatchScheduleErrorMilliseconds = Math.max(
+      maximumDispatchScheduleErrorMilliseconds,
+      Math.abs(sentAt - due),
+    );
+    let acknowledgement;
+    acknowledgement = session.send("Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x: expectedEvent.clientX,
+      y: expectedEvent.clientY,
+      deltaX: expectedEvent.deltaX,
+      deltaY: expectedEvent.deltaY,
+      modifiers: 0,
+    }).then(
+      () => {
+        dispatchAcks += 1;
+        maximumDispatchAckLatencyMilliseconds = Math.max(
+          maximumDispatchAckLatencyMilliseconds,
+          performance.now() - sentAt,
+        );
+        pendingAcks.delete(acknowledgement);
+      },
+      (error) => {
+        dispatchErrors.push(
+          error instanceof Error ? error.message : String(error),
+        );
+        pendingAcks.delete(acknowledgement);
+      },
+    );
+    pendingAcks.add(acknowledgement);
+    dispatchedEventCount += 1;
+    maximumInFlightObserved = Math.max(
+      maximumInFlightObserved,
+      pendingAcks.size,
+    );
+  }
+
+  const dispatchEndedAt = performance.now();
+  if (onDispatchComplete !== null) await onDispatchComplete();
+  await Promise.all([...pendingAcks]);
+  return {
+    dispatchAcks,
+    dispatchedEventCount,
+    dispatchStartedAt,
+    dispatchEndedAt,
+    maximumDispatchScheduleErrorMilliseconds,
+    maximumDispatchAckLatencyMilliseconds,
+    maximumInFlightObserved,
+    maximumInFlightAllowed: maximumInFlight,
+    dispatchErrors,
+  };
 }
 
 function sha256Json(value) {
@@ -553,7 +1094,7 @@ function matchesDeltaSequenceAllowingCoalescing(actualEvents, expectedEvents) {
       accumulatedDelta += expectedEvents[expectedIndex].deltaY;
       expectedIndex += 1;
     }
-    if (accumulatedDelta !== actual.deltaY) return false;
+    if (Math.abs(accumulatedDelta - actual.deltaY) > WHEEL_DELTA_EPSILON) return false;
   }
   return expectedIndex === expectedEvents.length;
 }
@@ -585,14 +1126,18 @@ function validateWheelEventContract(actualEvents, expectedEvents) {
     deltaY: mismatchIndexes(
       actualEvents,
       expectedEvents,
-      (actual, expected) => actual.deltaY === expected.deltaY,
+      (actual, expected) =>
+        Math.abs(actual.deltaY - expected.deltaY) <= WHEEL_DELTA_EPSILON,
     ),
   };
   const eventCountMatches = actualEvents.length === expectedEvents.length;
   const exactSequenceMatches =
     eventCountMatches &&
     Object.values(mismatch).every((indexes) => indexes.length === 0);
+  const exactDeltaSequenceMatches =
+    eventCountMatches && mismatch.deltaY.length === 0;
   const deltaSequenceMatchesAllowingCoalescing =
+    exactDeltaSequenceMatches ||
     matchesDeltaSequenceAllowingCoalescing(actualEvents, expectedEvents);
   const sequenceMatchesAllowingCoalescing =
     deltaSequenceMatchesAllowingCoalescing &&
@@ -665,6 +1210,110 @@ function summarizeIndexes(indexes) {
 
 function addInvalidReason(invalidReasons, code, details) {
   invalidReasons.push(`${code}: ${details}`);
+}
+
+function magnitudeRatio(actual, expected) {
+  if (!Number.isFinite(actual) || !Number.isFinite(expected)) return null;
+  if (expected === 0) return actual === 0 ? 1 : null;
+  return actual / expected;
+}
+
+function summarizeCaptureValidity(
+  strictInvalidReasons,
+  diagnostics,
+  legacyMousewheelBridge,
+  policy,
+) {
+  const blockingInvalidReasons =
+    policy === "diagnostic"
+      ? strictInvalidReasons.filter(
+          (reason) => !SOFT_INPUT_CAPTURE_REASON.test(reason),
+        )
+      : [...strictInvalidReasons];
+  const expectedCount = diagnostics.expectedEventCount;
+  const receivedCount = diagnostics.receivedEventCount;
+  const expectedMagnitude = diagnostics.expectedDeltaMagnitudePerDirection;
+  const receivedCountRatio = magnitudeRatio(receivedCount, expectedCount);
+  const negativeMagnitudeRatio = magnitudeRatio(
+    diagnostics.receivedNegativeDeltaMagnitude,
+    expectedMagnitude,
+  );
+  const positiveMagnitudeRatio = magnitudeRatio(
+    diagnostics.receivedPositiveDeltaMagnitude,
+    expectedMagnitude,
+  );
+  const mismatch = diagnostics.wheelContract?.mismatch || {};
+  const hardMismatchFields = ["isTrusted", "coordinates", "deltaMode", "deltaX"];
+  const hardMismatch = hardMismatchFields.filter(
+    (field) => Array.isArray(mismatch[field]) && mismatch[field].length > 0,
+  );
+  const relayConsistent =
+    !legacyMousewheelBridge.requested ||
+    ((legacyMousewheelBridge.browserLegacyCount || 0) +
+      (legacyMousewheelBridge.relayedCount || 0) >=
+      receivedCount &&
+      legacyMousewheelBridge.pluginRelayObservedCount ===
+        legacyMousewheelBridge.relayedCount &&
+      legacyMousewheelBridge.preventedCount ===
+        legacyMousewheelBridge.relayedCount &&
+      legacyMousewheelBridge.relayedEventsAreUntrusted === true);
+
+  if (policy === "diagnostic") {
+    if (receivedCountRatio === null || receivedCountRatio < 0.9) {
+      addInvalidReason(
+        blockingInvalidReasons,
+        "diagnostic-input-received-ratio",
+        `minimum=0.9 actual=${String(receivedCountRatio)}`,
+      );
+    }
+    if (negativeMagnitudeRatio === null || negativeMagnitudeRatio < 0.95) {
+      addInvalidReason(
+        blockingInvalidReasons,
+        "diagnostic-input-negative-magnitude-ratio",
+        `minimum=0.95 actual=${String(negativeMagnitudeRatio)}`,
+      );
+    }
+    if (positiveMagnitudeRatio === null || positiveMagnitudeRatio < 0.95) {
+      addInvalidReason(
+        blockingInvalidReasons,
+        "diagnostic-input-positive-magnitude-ratio",
+        `minimum=0.95 actual=${String(positiveMagnitudeRatio)}`,
+      );
+    }
+    if (diagnostics.allReceivedEventsTrusted !== true || hardMismatch.length > 0) {
+      addInvalidReason(
+        blockingInvalidReasons,
+        "diagnostic-input-event-contract",
+        `trusted=${String(diagnostics.allReceivedEventsTrusted)} hardMismatch=${hardMismatch.join(",") || "none"}`,
+      );
+    }
+    if (!relayConsistent) {
+      addInvalidReason(
+        blockingInvalidReasons,
+        "diagnostic-input-legacy-relay",
+        "legacy mousewheel relay counts are inconsistent with observed native wheel input",
+      );
+    }
+  }
+
+  return {
+    policy,
+    valid: blockingInvalidReasons.length === 0,
+    invalidReasons: blockingInvalidReasons,
+    strictValid: strictInvalidReasons.length === 0,
+    strictInvalidReasons: [...strictInvalidReasons],
+    varianceAccepted:
+      policy === "diagnostic" &&
+      blockingInvalidReasons.length === 0 &&
+      strictInvalidReasons.length > 0,
+    variance: {
+      receivedCountRatio,
+      negativeMagnitudeRatio,
+      positiveMagnitudeRatio,
+      deliveryMode: diagnostics.wheelContract?.deliveryMode || null,
+      relayConsistent,
+    },
+  };
 }
 
 function appendWheelContractInvalidReasons(
@@ -812,6 +1461,7 @@ function summarizeProbe(
   maximumDispatchScheduleErrorMilliseconds,
   maximumAllowedDispatchErrorMilliseconds,
   maximumDispatchAckLatencyMilliseconds,
+  wheelDeliveryWait,
 ) {
   const events = snapshot.wheelEvents;
   const intervals = calculatePostInputRafIntervals(
@@ -829,6 +1479,45 @@ function summarizeProbe(
     .filter((event) => event.deltaY < 0)
     .reduce((sum, event) => sum + Math.abs(event.deltaY), 0);
   const wheelContract = validateWheelEventContract(events, expectedEvents);
+  const firstEventTime = events[0]?.time ?? null;
+  let expectedEventIndex = 0;
+  const maximumReceivedScheduleErrorMilliseconds =
+    firstEventTime === null
+      ? null
+      : wheelContract.exactSequenceMatches
+        ? events.reduce(
+            (maximum, event, index) =>
+              Math.max(
+                maximum,
+                Math.abs(
+                  event.time -
+                    firstEventTime -
+                    expectedEvents[index].offsetMilliseconds,
+                ),
+              ),
+            0,
+          )
+      : events.reduce((maximum, event, index) => {
+          let accumulatedDelta = 0;
+          const direction = Math.sign(event.deltaY);
+          while (
+            expectedEventIndex < expectedEvents.length &&
+            Math.sign(expectedEvents[expectedEventIndex].deltaY) === direction &&
+            Math.abs(accumulatedDelta) + WHEEL_DELTA_EPSILON <
+              Math.abs(event.deltaY)
+          ) {
+            accumulatedDelta += expectedEvents[expectedEventIndex].deltaY;
+            expectedEventIndex += 1;
+          }
+          if (accumulatedDelta !== event.deltaY) return Number.POSITIVE_INFINITY;
+          const expectedOffset =
+            expectedEvents[expectedEventIndex - 1]?.offsetMilliseconds ??
+            (durationMs * index) / Math.max(1, expectedEvents.length - 1);
+          return Math.max(
+            maximum,
+            Math.abs(event.time - firstEventTime - expectedOffset),
+          );
+        }, 0);
   const frameMean =
     intervals.length > 0
       ? intervals.reduce((sum, value) => sum + value, 0) / intervals.length
@@ -836,8 +1525,16 @@ function summarizeProbe(
   return {
     expectedEventCount: expectedEvents.length,
     receivedEventCount: events.length,
+    receivedDeltaYSequence: events.map((event) => event.deltaY),
+    receivedWheelEventSamples: events.slice(0, 20),
     receivedEventTypes: [...new Set(events.map((event) => event.targetTag))],
     legacyMousewheelEventCount: snapshot.legacyMousewheelEvents.length,
+    browserLegacyMousewheelEventCount: snapshot.legacyMousewheelEvents.filter(
+      (event) => event.source === "browser",
+    ).length,
+    pluginRelayMousewheelEventCount: snapshot.legacyMousewheelEvents.filter(
+      (event) => event.source === "plugin-relay",
+    ).length,
     allReceivedEventsTrusted: wheelContract.mismatch.isTrusted.length === 0,
     wheelContract,
     receivedNegativeDeltaMagnitude: negativeMagnitude,
@@ -860,7 +1557,14 @@ function summarizeProbe(
     dispatchTimingWithinContract:
       maximumDispatchScheduleErrorMilliseconds <=
       maximumAllowedDispatchErrorMilliseconds,
+    maximumReceivedScheduleErrorMilliseconds,
+    receivedTimingWithinContract:
+      wheelContract.sequenceMatchesAllowingCoalescing &&
+      maximumReceivedScheduleErrorMilliseconds !== null &&
+      maximumReceivedScheduleErrorMilliseconds <=
+        maximumAllowedDispatchErrorMilliseconds,
     maximumDispatchAckLatencyMilliseconds,
+    wheelDeliveryWait,
     rafDiagnostic: {
       isGpuPresentationFps: false,
       label: "requestAnimationFrame cadence diagnostic only",
@@ -918,6 +1622,10 @@ async function main(options) {
   const x = numberOption(options, "x", undefined, 0, 100000);
   const y = numberOption(options, "y", undefined, 0, 100000);
   const deltaMagnitude = numberOption(options, "delta-y", 40, 0.01, 10000);
+  if (!Number.isInteger(deltaMagnitude)) {
+    throw new Error("--delta-y must be an integer for wheel input compatibility.");
+  }
+  const sequenceSeed = String(options["sequence-seed"] || "chrome-devtools-lab-human-wheel-v1");
   const maximumAllowedDispatchErrorMilliseconds = numberOption(
     options,
     "max-dispatch-error",
@@ -927,22 +1635,59 @@ async function main(options) {
   );
   const expectedEnvironment = parseExpectedEnvironmentContract(options);
   const showFpsCounter = options["show-fps-counter"] === true;
+  const inputBackend = String(options["input-backend"] || "cdp");
+  if (!["cdp", "windows-native"].includes(inputBackend)) {
+    throw new Error(`Invalid --input-backend: ${inputBackend}. Use cdp or windows-native.`);
+  }
+  const postFocusWindowBounds = parsePostFocusWindowPlacement(
+    options,
+    inputBackend,
+  );
+  const inputDeliveryPolicy = String(
+    options["input-delivery-policy"] || "strict",
+  );
+  if (!INPUT_DELIVERY_POLICIES.has(inputDeliveryPolicy)) {
+    throw new Error(
+      `Invalid --input-delivery-policy: ${inputDeliveryPolicy}. Use strict or diagnostic.`,
+    );
+  }
   const useLegacyMousewheelBridge =
     options["legacy-mousewheel-bridge"] === true;
   const skipMidpointScreenshot =
     options["skip-midpoint-screenshot"] === true;
+  const traceProfile = String(options["trace-profile"] || "full");
+  const traceCategories = TRACE_PROFILES[traceProfile];
+  if (!Object.hasOwn(TRACE_PROFILES, traceProfile)) {
+    throw new Error(
+      `Invalid --trace-profile: ${traceProfile}. Use ${Object.keys(TRACE_PROFILES).join(" or ")}.`,
+    );
+  }
+  const traceEnabled = traceProfile !== "none";
   const fpsCounterHoldMs = showFpsCounter
     ? integerOption(options, "fps-counter-hold", 0, 0, 600000)
     : 0;
   const output = options.output;
   if (typeof output !== "string" || output.length === 0)
     throw new Error("Wheel benchmark requires --output <json>.");
+  const analyzedOutput =
+    typeof options["analyzed-output"] === "string"
+      ? path.resolve(options["analyzed-output"])
+      : null;
   const traceOutput =
     typeof options["trace-output"] === "string"
       ? options["trace-output"]
       : `${output}.trace.json`;
-  const { target, host, port } = await selectTarget(options);
+  const { target, host, port, targetResolution } = await selectTarget(options);
   const session = await connect(target.webSocketDebuggerUrl, timeoutMs);
+  let traceSession = null;
+  if (traceEnabled) {
+    try {
+      traceSession = await connect(target.webSocketDebuggerUrl, timeoutMs);
+    } catch (error) {
+      session.close();
+      throw error;
+    }
+  }
   let tracingStarted = false;
   let traceComplete = null;
   let traceLock = null;
@@ -968,22 +1713,24 @@ async function main(options) {
     inputLatencyKpiValid: !useLegacyMousewheelBridge,
     renderingComparisonValid: true,
   };
-  session.onEvent("Tracing.dataCollected", (params) => {
-    if (Array.isArray(params.value)) collectedEvents.push(...params.value);
-  });
-  session.onEvent("Tracing.bufferUsage", (params) => {
-    traceBufferUsageSamples.push({
-      sampledAtMilliseconds: performance.now(),
-      percentFull:
-        typeof params.percentFull === "number"
-          ? params.percentFull
-          : typeof params.value === "number"
-            ? params.value
-            : null,
-      eventCount:
-        typeof params.eventCount === "number" ? params.eventCount : null,
+  if (traceSession !== null) {
+    traceSession.onEvent("Tracing.dataCollected", (params) => {
+      if (Array.isArray(params.value)) collectedEvents.push(...params.value);
     });
-  });
+    traceSession.onEvent("Tracing.bufferUsage", (params) => {
+      traceBufferUsageSamples.push({
+        sampledAtMilliseconds: performance.now(),
+        percentFull:
+          typeof params.percentFull === "number"
+            ? params.percentFull
+            : typeof params.value === "number"
+              ? params.value
+              : null,
+        eventCount:
+          typeof params.eventCount === "number" ? params.eventCount : null,
+      });
+    });
+  }
   try {
     if (showFpsCounter) {
       await setNativeFpsCounter(session, true);
@@ -991,9 +1738,16 @@ async function main(options) {
     }
     const page = await evaluate(
       session,
-      "({ url: location.href, title: document.title, visibilityState: document.visibilityState, dpr: devicePixelRatio, viewport: { width: innerWidth, height: innerHeight }, scrollX: window.scrollX, scrollY: window.scrollY })",
+      "({ url: location.href, title: document.title, visibilityState: document.visibilityState, dpr: devicePixelRatio, screenX: screenX, screenY: screenY, outerWidth: outerWidth, outerHeight: outerHeight, viewport: { width: innerWidth, height: innerHeight }, scrollX: window.scrollX, scrollY: window.scrollY })",
     );
-    const preflight = await installProbe(session, useLegacyMousewheelBridge);
+    target.title = page.title;
+    target.url = page.url;
+    const preflight = await installProbe(
+      session,
+      useLegacyMousewheelBridge,
+      { x, y },
+      traceEnabled,
+    );
     legacyMousewheelBridge.enabled = useLegacyMousewheelBridge;
     const canvas = preflight.rect;
     if (
@@ -1006,41 +1760,36 @@ async function main(options) {
         `Point (${x}, ${y}) is outside canvas ${JSON.stringify(canvas)}`,
       );
     }
-    await session.send("Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x,
-      y,
-      button: "none",
-      buttons: 0,
-      pointerType: "mouse",
-    });
+    if (inputBackend === "cdp") {
+      await session.send("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x,
+        y,
+        button: "none",
+        buttons: 0,
+        pointerType: "mouse",
+      });
+    }
     await sleep(POINTER_SETTLE_MS);
     const beforeHash = await captureCanvasHash(session, canvas);
-    traceLock = await acquireTraceLock({
-      host,
-      port,
-      timeoutMs,
-      metadata: { script: "wheel-benchmark", targetId: target.id },
-    });
-    await session.send("Tracing.start", {
-      categories: TRACE_CATEGORIES,
-      options: "record-continuously",
-      bufferUsageReportingInterval: 250,
-      transferMode: "ReturnAsStream",
-    });
-    tracingStarted = true;
-    traceComplete = session.waitForEvent("Tracing.tracingComplete");
-    await evaluate(
-      session,
-      `performance.mark(${JSON.stringify(TRACE_WHEEL_START_MARKER)}); console.timeStamp(${JSON.stringify(TRACE_WHEEL_START_MARKER)})`,
-    );
+    if (traceSession !== null) {
+      traceLock = await acquireTraceLock({
+        host,
+        port,
+        timeoutMs,
+        metadata: { script: "wheel-benchmark", targetId: target.id },
+      });
+      await traceSession.send("Tracing.start", {
+        categories: traceCategories,
+        options: "record-continuously",
+        bufferUsageReportingInterval: 250,
+        transferMode: "ReturnAsStream",
+      });
+      tracingStarted = true;
+      traceComplete = traceSession.waitForEvent("Tracing.tracingComplete");
+    }
+    const probeMeasurementReset = await resetProbeForMeasurement(session);
     const dispatchStartEpochMs = Date.now();
-    const dispatchStartedAt = performance.now();
-    let dispatchAcks = 0;
-    let maximumDispatchScheduleErrorMs = 0;
-    let maximumDispatchAckLatencyMs = 0;
-    const dispatchPromises = [];
-    const dispatchErrors = [];
     const midpointHashPromise = skipMidpointScreenshot
       ? Promise.resolve({ hash: null, error: null })
       : (async () => {
@@ -1055,48 +1804,43 @@ async function main(options) {
       count,
       { x, y },
       deltaMagnitude,
+      durationMs,
+      sequenceSeed,
+      inputBackend,
     );
-    for (let index = 0; index < count; index += 1) {
-      const due = dispatchStartedAt + (durationMs * index) / (count - 1);
-      const delay = due - performance.now();
-      if (delay > 0) await sleep(delay);
-      const expectedEvent = expectedEvents[index];
-      const sentAt = performance.now();
-      maximumDispatchScheduleErrorMs = Math.max(
-        maximumDispatchScheduleErrorMs,
-        Math.abs(sentAt - due),
-      );
-      const dispatchPromise = session
-        .send("Input.dispatchMouseEvent", {
-          type: "mouseWheel",
-          x: expectedEvent.clientX,
-          y: expectedEvent.clientY,
-          deltaX: expectedEvent.deltaX,
-          deltaY: expectedEvent.deltaY,
-          modifiers: 0,
+    const dispatch = inputBackend === "windows-native"
+      ? await dispatchNativeWheelSequence({
+          target,
+          port,
+          page,
+          expectedEvents,
+          durationMs,
+          timeoutMs,
+          postFocusWindowBounds,
         })
-        .then(
-          () => {
-            dispatchAcks += 1;
-            maximumDispatchAckLatencyMs = Math.max(
-              maximumDispatchAckLatencyMs,
-              performance.now() - sentAt,
-            );
-          },
-          (error) => {
-            dispatchErrors.push(
-              error instanceof Error ? error.message : String(error),
-            );
-            throw error;
-          },
+      : await dispatchWheelSequence(
+          session,
+          expectedEvents,
+          durationMs,
+          MAX_IN_FLIGHT_WHEEL_DISPATCHES,
+          traceSession === null
+            ? null
+            : () =>
+                evaluate(
+                  session,
+                  `performance.mark(${JSON.stringify(TRACE_WHEEL_END_MARKER)}); console.timeStamp(${JSON.stringify(TRACE_WHEEL_END_MARKER)})`,
+                ),
         );
-      dispatchPromises.push(dispatchPromise);
+    if (traceSession !== null && inputBackend === "windows-native") {
+      await evaluate(
+        session,
+        `performance.mark(${JSON.stringify(TRACE_WHEEL_END_MARKER)}); console.timeStamp(${JSON.stringify(TRACE_WHEEL_END_MARKER)})`,
+      );
     }
-    await Promise.all(dispatchPromises);
-    const dispatchEndEpochMs = Date.now();
-    await evaluate(
-      session,
-      `performance.mark(${JSON.stringify(TRACE_WHEEL_END_MARKER)}); console.timeStamp(${JSON.stringify(TRACE_WHEEL_END_MARKER)})`,
+    const dispatchEndEpochMs = Math.round(
+      dispatchStartEpochMs +
+        dispatch.dispatchEndedAt -
+        dispatch.dispatchStartedAt,
     );
     const midpointCapture = await midpointHashPromise;
     if (midpointCapture.error) throw midpointCapture.error;
@@ -1106,39 +1850,48 @@ async function main(options) {
       `new Promise((resolve) => { let count = 0; const tick = () => { if (++count >= ${postFrames}) resolve(true); else requestAnimationFrame(tick); }; requestAnimationFrame(tick); })`,
     );
     await sleep(settleMs);
+    const wheelDeliveryWait = await waitForProbeWheelDelivery(
+      session,
+      expectedEvents.length,
+      WHEEL_DELIVERY_WAIT_MAX_MS,
+    );
     const afterHash = await captureCanvasHash(session, canvas);
     const disposed = await disposeProbe(session);
-    await session.send("Tracing.end");
-    await evaluate(
-      session,
-      `performance.clearMarks(${JSON.stringify(TRACE_WHEEL_START_MARKER)}); performance.clearMarks(${JSON.stringify(TRACE_WHEEL_END_MARKER)})`,
-    );
-    const complete = await Promise.race([
-      traceComplete,
-      new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error("Tracing.tracingComplete timed out")),
-          timeoutMs,
+    let complete = null;
+    let trace = null;
+    if (traceSession !== null) {
+      await traceSession.send("Tracing.end");
+      await evaluate(
+        session,
+        `performance.clearMarks(${JSON.stringify(TRACE_WHEEL_START_MARKER)}); performance.clearMarks(${JSON.stringify(TRACE_WHEEL_END_MARKER)})`,
+      );
+      complete = await Promise.race([
+        traceComplete,
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("Tracing.tracingComplete timed out")),
+            timeoutMs,
+          ),
         ),
-      ),
-    ]);
-    const traceText = complete.stream
-      ? await readTraceStream(session, complete.stream)
-      : JSON.stringify({ traceEvents: collectedEvents });
-    await traceLock.release();
-    traceLock = null;
-    const parsedTrace = JSON.parse(traceText);
-    const trace = Array.isArray(parsedTrace)
-      ? { traceEvents: parsedTrace }
-      : parsedTrace;
-    await fs.mkdir(path.dirname(path.resolve(traceOutput)), {
-      recursive: true,
-    });
-    await fs.writeFile(
-      path.resolve(traceOutput),
-      `${JSON.stringify(trace)}\n`,
-      "utf8",
-    );
+      ]);
+      const traceText = complete.stream
+        ? await readTraceStream(traceSession, complete.stream)
+        : JSON.stringify({ traceEvents: collectedEvents });
+      await traceLock.release();
+      traceLock = null;
+      const parsedTrace = JSON.parse(traceText);
+      trace = Array.isArray(parsedTrace)
+        ? { traceEvents: parsedTrace }
+        : parsedTrace;
+      await fs.mkdir(path.dirname(path.resolve(traceOutput)), {
+        recursive: true,
+      });
+      await fs.writeFile(
+        path.resolve(traceOutput),
+        `${JSON.stringify(trace)}\n`,
+        "utf8",
+      );
+    }
     const snapshot = disposed.snapshot;
     const pageAfter = await evaluate(
       session,
@@ -1149,14 +1902,20 @@ async function main(options) {
       expectedEvents,
       durationMs,
       postFrames,
-      maximumDispatchScheduleErrorMs,
+      dispatch.maximumDispatchScheduleErrorMilliseconds,
       maximumAllowedDispatchErrorMilliseconds,
-      maximumDispatchAckLatencyMs,
+      dispatch.maximumDispatchAckLatencyMilliseconds,
+      wheelDeliveryWait,
     );
     const relayEvents =
       disposed.snapshot.legacyMousewheelBridge?.relayEvents || [];
     legacyMousewheelBridge.relayedCount = relayEvents.filter(
       (event) => event.relayed === true,
+    ).length;
+    legacyMousewheelBridge.skippedNativeHandledCount = relayEvents.filter(
+      (event) =>
+        event.relayed === false &&
+        event.reason === "outer-wheel-already-prevented",
     ).length;
     legacyMousewheelBridge.preventedCount = relayEvents.filter(
       (event) => event.defaultPrevented === true,
@@ -1167,6 +1926,13 @@ async function main(options) {
     legacyMousewheelBridge.relayedEventsAreUntrusted = relayEvents
       .filter((event) => event.relayed === true)
       .every((event) => event.relayedIsTrusted === false);
+    legacyMousewheelBridge.browserLegacyCount =
+      diagnostics.browserLegacyMousewheelEventCount;
+    legacyMousewheelBridge.pluginRelayObservedCount =
+      diagnostics.pluginRelayMousewheelEventCount;
+    legacyMousewheelBridge.inputLatencyKpiValid =
+      legacyMousewheelBridge.relayedCount === 0 &&
+      diagnostics.browserLegacyMousewheelEventCount >= count;
     const preflightEnvironment = normalizePreflightEnvironment(preflight);
     const preflightEnvironmentResult = compareEnvironmentContract(
       preflightEnvironment,
@@ -1183,35 +1949,37 @@ async function main(options) {
       count,
       !skipMidpointScreenshot,
     );
-    const traceCompleteness = summarizeTraceCompleteness(
-      trace,
-      complete,
-      traceBufferUsageSamples,
-    );
-    const traceEventCount = traceCompleteness.traceEventCount;
-    const traceEvents = Array.isArray(trace.traceEvents)
+    const traceCompleteness = traceEnabled
+      ? summarizeTraceCompleteness(trace, complete, traceBufferUsageSamples)
+      : null;
+    const traceEventCount = traceCompleteness?.traceEventCount ?? 0;
+    const traceEvents = Array.isArray(trace?.traceEvents)
       ? trace.traceEvents
       : [];
-    const frameRateWindow = findTraceWindow(traceEvents, {
-      startLabel: TRACE_WHEEL_START_MARKER,
-      endLabel: TRACE_WHEEL_END_MARKER,
-      targetId: target.id,
-    });
-    const compositorFrameRate = analyzeCompositorFps(traceEvents, {
-      targetId: target.id,
-      window: frameRateWindow,
-    });
+    const frameRateWindow = traceEnabled
+      ? findTraceWindow(traceEvents, {
+          startLabel: TRACE_WHEEL_START_MARKER,
+          endLabel: TRACE_WHEEL_END_MARKER,
+          targetId: target.id,
+        })
+      : null;
+    const compositorFrameRate = traceEnabled
+      ? analyzeCompositorFps(traceEvents, {
+          targetId: target.id,
+          window: frameRateWindow,
+        })
+      : null;
     diagnostics.compositorFrameRate = compositorFrameRate;
     if (fpsCounterHoldMs > 0) {
       await sleep(fpsCounterHoldMs);
       fpsCounter.heldForMilliseconds = fpsCounterHoldMs;
     }
     const invalidReasons = [];
-    if (dispatchAcks !== count) {
+    if (dispatch.dispatchAcks !== count) {
       addInvalidReason(
         invalidReasons,
         "cdp-wheel-ack-count-mismatch",
-        `expected=${count} actual=${dispatchAcks}`,
+        `expected=${count} actual=${dispatch.dispatchAcks}`,
       );
     }
     appendWheelContractInvalidReasons(
@@ -1219,6 +1987,22 @@ async function main(options) {
       diagnostics.wheelContract,
       expectedEvents,
     );
+    if (
+      useLegacyMousewheelBridge &&
+      (diagnostics.browserLegacyMousewheelEventCount +
+          legacyMousewheelBridge.relayedCount <
+          count ||
+        diagnostics.pluginRelayMousewheelEventCount !==
+          legacyMousewheelBridge.relayedCount ||
+        legacyMousewheelBridge.preventedCount !==
+          legacyMousewheelBridge.relayedCount)
+    ) {
+      addInvalidReason(
+        invalidReasons,
+        "legacy-wheel-handler-count-mismatch",
+        `expected=${count} browserLegacy=${diagnostics.browserLegacyMousewheelEventCount} relayed=${legacyMousewheelBridge.relayedCount} pluginRelayObserved=${diagnostics.pluginRelayMousewheelEventCount} prevented=${legacyMousewheelBridge.preventedCount}`,
+      );
+    }
     appendEnvironmentInvalidReasons(
       invalidReasons,
       "preflight",
@@ -1267,42 +2051,62 @@ async function main(options) {
       addInvalidReason(
         invalidReasons,
         "wheel-dispatch-timing-out-of-contract",
-        `maximumScheduleErrorMs=${maximumDispatchScheduleErrorMs} allowedMs=${maximumAllowedDispatchErrorMilliseconds}`,
+        `maximumScheduleErrorMs=${dispatch.maximumDispatchScheduleErrorMilliseconds} allowedMs=${maximumAllowedDispatchErrorMilliseconds}`,
       );
-    if (dispatchErrors.length > 0)
+    if (!diagnostics.receivedTimingWithinContract)
+      addInvalidReason(
+        invalidReasons,
+        "dom-wheel-timing-out-of-contract",
+        `maximumScheduleErrorMs=${diagnostics.maximumReceivedScheduleErrorMilliseconds} allowedMs=${maximumAllowedDispatchErrorMilliseconds}`,
+      );
+    if (dispatch.dispatchErrors.length > 0)
       addInvalidReason(
         invalidReasons,
         "wheel-dispatch-error",
-        `count=${dispatchErrors.length} first=${dispatchErrors[0]}`,
+        `count=${dispatch.dispatchErrors.length} first=${dispatch.dispatchErrors[0]}`,
       );
-    if (!traceCompleteness.traceEventArrayPresent)
+    if (traceEnabled && !traceCompleteness.traceEventArrayPresent)
       addInvalidReason(
         invalidReasons,
         "trace-event-array-missing",
         "expected trace.traceEvents array",
       );
-    if (traceCompleteness.traceEventArrayPresent && traceEventCount === 0)
+    if (traceEnabled && traceCompleteness.traceEventArrayPresent && traceEventCount === 0)
       addInvalidReason(
         invalidReasons,
         "trace-events-empty",
         "expected at least one trace event",
       );
-    if (complete.dataLossOccurred === true)
+    if (traceEnabled && frameRateWindow?.applied !== true)
+      addInvalidReason(
+        invalidReasons,
+        "trace-frame-rate-window-missing",
+        `source=${frameRateWindow?.source || "unknown"} startLabel=${TRACE_WHEEL_START_MARKER} endLabel=${TRACE_WHEEL_END_MARKER}`,
+      );
+    if (traceEnabled && complete.dataLossOccurred === true)
       addInvalidReason(
         invalidReasons,
         "trace-data-loss-reported",
         "Tracing.tracingComplete dataLossOccurred=true",
       );
-    if (traceCompleteness.bufferCapacityReached)
+    if (traceEnabled && traceCompleteness.bufferCapacityReached)
       addInvalidReason(
         invalidReasons,
         "trace-buffer-capacity-reached",
         `maximumPercentFull=${traceCompleteness.maximumBufferPercentFull}`,
       );
+    const captureValidity = summarizeCaptureValidity(
+      invalidReasons,
+      diagnostics,
+      legacyMousewheelBridge,
+      inputDeliveryPolicy,
+    );
     const result = {
       schemaVersion: 5,
-      valid: invalidReasons.length === 0,
-      invalidReasons,
+      valid: captureValidity.valid,
+      invalidReasons: captureValidity.invalidReasons,
+      strictValid: captureValidity.strictValid,
+      strictInvalidReasons: captureValidity.strictInvalidReasons,
       target: { id: target.id, title: target.title, url: target.url },
       page,
       pageAfter,
@@ -1319,20 +2123,38 @@ async function main(options) {
         },
       },
       point: { x, y },
-      input: {
-        type: "mouseWheel",
+    input: {
+        type: inputBackend === "windows-native" ? "windows-MOUSEEVENTF_WHEEL" : "mouseWheel",
+        backend: inputBackend,
         count,
         deltaMagnitude,
-        directionSequence: "negative-first-half-positive-second-half",
+        requestedDeltaMagnitude: deltaMagnitude,
+        nativeWheelDeltaToDomScale:
+          inputBackend === "windows-native"
+            ? NATIVE_WHEEL_DELTA_TO_DOM_SCALE
+            : null,
+        directionSequence: "seeded-human-bursts",
+        sequenceSeed,
+        deliveryPolicy: inputDeliveryPolicy,
+        captureValidity,
         expectedDeltaMode: 0,
         expectedDeltaX: 0,
         expectedDeltaYSequenceSha256:
           diagnostics.wheelContract.expectedDeltaYSequenceSha256,
-        dispatchAcks,
-        dispatchAckCountMatches: dispatchAcks === count,
-        maximumDispatchErrorMilliseconds: maximumDispatchScheduleErrorMs,
+        dispatchAcks: dispatch.dispatchAcks,
+        dispatchAckCountMatches: dispatch.dispatchAcks === count,
+        dispatchedEventCount: dispatch.dispatchedEventCount,
+        maximumDispatchErrorMilliseconds:
+          dispatch.maximumDispatchScheduleErrorMilliseconds,
         maximumAllowedDispatchErrorMilliseconds,
-        maximumDispatchAckLatencyMilliseconds: maximumDispatchAckLatencyMs,
+        maximumDispatchAckLatencyMilliseconds:
+          dispatch.maximumDispatchAckLatencyMilliseconds,
+        maximumInFlightObserved: dispatch.maximumInFlightObserved,
+        maximumInFlightAllowed: dispatch.maximumInFlightAllowed,
+        nativeInput: dispatch.nativeInput || null,
+        targetResolution,
+        probeMeasurementReset,
+        wheelDeliveryWait,
         wallClock: {
           dispatchStartEpochMs,
           dispatchEndEpochMs,
@@ -1344,16 +2166,24 @@ async function main(options) {
       diagnostics,
       fpsCounter,
       trace: {
-        path: path.resolve(traceOutput),
-        recordingMode: "record-continuously",
+        enabled: traceEnabled,
+        path: traceEnabled ? path.resolve(traceOutput) : null,
+        analysisOutput: traceEnabled ? analyzedOutput : null,
+        recordingMode: traceEnabled ? "record-continuously" : null,
+        profile: traceProfile,
+        categories: traceCategories,
         eventCount: traceEventCount,
-        transferMode: complete.stream ? "ReturnAsStream" : "dataCollected",
-        streamFormat: complete.traceFormat || null,
-        streamCompression: complete.streamCompression || null,
+        transport: traceEnabled
+          ? "separate-browser-cdp-session"
+          : "disabled",
+        transferMode: complete?.stream ? "ReturnAsStream" : traceEnabled ? "dataCollected" : null,
+        streamFormat: complete?.traceFormat || null,
+        streamCompression: complete?.streamCompression || null,
         bufferUsage: {
-          reportingIntervalMilliseconds: 250,
+          reportingIntervalMilliseconds: traceEnabled ? 250 : null,
           sampleCount: traceBufferUsageSamples.length,
-          maximumPercentFull: traceCompleteness.maximumBufferPercentFull,
+          maximumPercentFull:
+            traceCompleteness?.maximumBufferPercentFull ?? null,
           maximumEventCount: traceBufferUsageSamples.reduce(
             (maximum, sample) =>
               sample.eventCount === null
@@ -1375,13 +2205,13 @@ async function main(options) {
           source: "Display::FrameDisplayed / system Present",
           isFinalDisplayPresentFps: true,
           reason:
-            "This wheel benchmark does not claim final display FPS; use the optional PresentMon backend with the required Windows tracing privilege.",
+            "This sample did not produce an analyzed browser presentation KPI. Enable a trace profile for target-correlated Display::FrameDisplayed cadence; use PresentMon only for an optional independent Windows ETW/DWM measurement.",
         },
       },
       performanceKpi: {
         valid: false,
         reason:
-          "Final display Present FPS is not asserted here; use frameRate.compositor for Chrome compositor draw/swap FPS and the optional PresentMon backend for DWM/display FPS.",
+          "No qualified browser presentation FPS is asserted here. Enable a trace profile and require valid Display::FrameDisplayed evidence; compositor cadence and optional PresentMon ETW/DWM data remain separate layers.",
       },
     };
     await fs.mkdir(path.dirname(path.resolve(output)), { recursive: true });
@@ -1390,11 +2220,26 @@ async function main(options) {
       `${JSON.stringify(result, null, 2)}\n`,
       "utf8",
     );
+    if (traceEnabled && analyzedOutput !== null) {
+      const analyzed = analyzeTrace(
+        trace,
+        50,
+        frameRateWindow,
+        result,
+        target.id,
+      );
+      await fs.mkdir(path.dirname(analyzedOutput), { recursive: true });
+      await fs.writeFile(
+        analyzedOutput,
+        `${JSON.stringify(analyzed, null, 2)}\n`,
+        "utf8",
+      );
+    }
     console.log(JSON.stringify(result, null, 2));
   } finally {
     if (tracingStarted) {
       try {
-        await session.send("Tracing.end");
+        await traceSession?.send("Tracing.end");
       } catch {}
     }
     if (traceLock) {
@@ -1407,11 +2252,13 @@ async function main(options) {
         await setNativeFpsCounter(session, false);
       } catch {}
     }
+    traceSession?.close();
     session.close();
   }
 }
 
-function runSelfTests() {
+async function runSelfTests() {
+  assert.equal(TRACE_PROFILES.none, null);
   const parsed = parseArgs([
     "--expected-dpr",
     "1",
@@ -1442,12 +2289,96 @@ function runSelfTests() {
       }),
     /requires --expected-canvas-height/,
   );
-
-  const expectedEvents = createExpectedWheelEvents(4, { x: 596, y: 514 }, 40);
   assert.deepEqual(
-    expectedEvents.map((event) => event.deltaY),
-    [-40, -40, 40, 40],
+    parsePostFocusWindowPlacement(
+      {
+        "post-focus-window-left": "0",
+        "post-focus-window-top": "0",
+        "post-focus-window-width": "1377",
+        "post-focus-window-height": "1039",
+      },
+      "windows-native",
+    ),
+    { left: 0, top: 0, width: 1377, height: 1039 },
   );
+  assert.throws(
+    () =>
+      parsePostFocusWindowPlacement(
+        { "post-focus-window-left": "0" },
+        "windows-native",
+      ),
+    /requires all of/,
+  );
+  assert.throws(
+    () =>
+      parsePostFocusWindowPlacement(
+        {
+          "post-focus-window-left": "0",
+          "post-focus-window-top": "0",
+          "post-focus-window-width": "1377",
+          "post-focus-window-height": "1039",
+        },
+        "cdp",
+      ),
+    /only valid with --input-backend windows-native/,
+  );
+
+  const expectedEvents = createExpectedWheelEvents(
+    4,
+    { x: 596, y: 514 },
+    40,
+    100,
+    "wheel-benchmark-self-test",
+  );
+  assert.equal(expectedEvents.length, 4);
+  assert.equal(expectedEvents[0].offsetMilliseconds, 0);
+  assert.equal(expectedEvents.at(-1).offsetMilliseconds, 100);
+  assert.equal(expectedEvents.reduce((sum, event) => sum + event.deltaY, 0), 0);
+  const nativeExpectedEvents = createExpectedWheelEvents(
+    4,
+    { x: 596, y: 514 },
+    40,
+    100,
+    "wheel-benchmark-self-test",
+    "windows-native",
+  );
+  assert.deepEqual(
+    nativeExpectedEvents.map((event) => event.nativeDeltaY),
+    expectedEvents.map((event) => -Math.sign(event.deltaY) * 36),
+  );
+  assert.deepEqual(
+    nativeExpectedEvents.map((event) => event.deltaY),
+    expectedEvents.map((event) => event.deltaY),
+  );
+  const delayedDispatch = await dispatchWheelSequence(
+    {
+      send: async () => {
+        await sleep(40);
+      },
+    },
+    expectedEvents,
+    30,
+  );
+  assert.equal(delayedDispatch.dispatchedEventCount, 4);
+  assert.equal(delayedDispatch.dispatchAcks, 4);
+  assert.equal(delayedDispatch.dispatchErrors.length, 0);
+  assert.ok(delayedDispatch.maximumInFlightObserved > 1);
+  assert.ok(
+    delayedDispatch.maximumDispatchScheduleErrorMilliseconds < 20,
+  );
+  const inFlightLimited = await dispatchWheelSequence(
+    {
+      send: async () => {
+        await sleep(100);
+      },
+    },
+    expectedEvents,
+    3,
+    2,
+  );
+  assert.equal(inFlightLimited.dispatchedEventCount, 2);
+  assert.equal(inFlightLimited.dispatchAcks, 2);
+  assert.equal(inFlightLimited.dispatchErrors.length, 1);
   const exactEvents = expectedEvents.map((event) => ({
     ...event,
     targetTag: "CANVAS",
@@ -1459,8 +2390,14 @@ function runSelfTests() {
   assert.equal(exactContract.deliveryMode, "exact");
 
   const coalescedEvents = [
-    { ...exactEvents[0], deltaY: -80 },
-    { ...exactEvents[2], deltaY: 80 },
+    {
+      ...exactEvents[0],
+      deltaY: exactEvents.slice(0, 2).reduce((sum, event) => sum + event.deltaY, 0),
+    },
+    {
+      ...exactEvents[2],
+      deltaY: exactEvents.slice(2, 4).reduce((sum, event) => sum + event.deltaY, 0),
+    },
   ];
   const coalescedContract = validateWheelEventContract(
     coalescedEvents,
@@ -1480,7 +2417,10 @@ function runSelfTests() {
   assert.deepEqual(coalescedReasons, []);
 
   const missingDeltaEvents = [
-    { ...exactEvents[0], deltaY: -80 },
+    {
+      ...exactEvents[0],
+      deltaY: exactEvents.slice(0, 2).reduce((sum, event) => sum + event.deltaY, 0),
+    },
     { ...exactEvents[2], deltaY: 40 },
   ];
   const missingDeltaContract = validateWheelEventContract(
@@ -1497,12 +2437,72 @@ function runSelfTests() {
   );
   assert.equal(missingDeltaReasons.length, 2);
 
+  const softInputReasons = [
+    "dom-wheel-event-count-mismatch: expected=600 actual=598",
+    "dom-wheel-delta-y-sequence-mismatch: expectedSequenceSha256=a actualSequenceSha256=b",
+    "legacy-wheel-handler-count-mismatch: expected=600 browserLegacy=0 relayed=598 pluginRelayObserved=598 prevented=598",
+    "dom-wheel-timing-out-of-contract: maximumScheduleErrorMs=Infinity allowedMs=66",
+  ];
+  const diagnosticInput = {
+    expectedEventCount: 600,
+    receivedEventCount: 598,
+    expectedDeltaMagnitudePerDirection: 12000,
+    receivedNegativeDeltaMagnitude: 11960,
+    receivedPositiveDeltaMagnitude: 11960,
+    allReceivedEventsTrusted: true,
+    wheelContract: {
+      deliveryMode: "mismatch",
+      mismatch: {
+        isTrusted: [],
+        coordinates: [],
+        deltaMode: [],
+        deltaX: [],
+      },
+    },
+  };
+  const diagnosticRelay = {
+    requested: true,
+    browserLegacyCount: 0,
+    relayedCount: 598,
+    pluginRelayObservedCount: 598,
+    preventedCount: 598,
+    relayedEventsAreUntrusted: true,
+  };
+  const strictCaptureValidity = summarizeCaptureValidity(
+    softInputReasons,
+    diagnosticInput,
+    diagnosticRelay,
+    "strict",
+  );
+  assert.equal(strictCaptureValidity.valid, false);
+  assert.equal(strictCaptureValidity.strictValid, false);
+  const diagnosticCaptureValidity = summarizeCaptureValidity(
+    softInputReasons,
+    diagnosticInput,
+    diagnosticRelay,
+    "diagnostic",
+  );
+  assert.equal(diagnosticCaptureValidity.valid, true);
+  assert.equal(diagnosticCaptureValidity.varianceAccepted, true);
+  assert.equal(
+    summarizeCaptureValidity(
+      softInputReasons,
+      {
+        ...diagnosticInput,
+        receivedNegativeDeltaMagnitude: 11000,
+      },
+      diagnosticRelay,
+      "diagnostic",
+    ).valid,
+    false,
+  );
+
   const mismatchedEvents = exactEvents.map((event) => ({ ...event }));
   mismatchedEvents[0].isTrusted = false;
   mismatchedEvents[1].clientX += 1;
   mismatchedEvents[2].deltaMode = 1;
   mismatchedEvents[2].deltaX = 1;
-  mismatchedEvents[3].deltaY = -40;
+  mismatchedEvents[3].deltaY = -expectedEvents[3].deltaY;
   const mismatchedContract = validateWheelEventContract(
     mismatchedEvents,
     expectedEvents,
@@ -1609,16 +2609,20 @@ function runSelfTests() {
     valid: true,
     checks: [
       "required-environment-parameters",
+      "post-focus-native-window-placement-contract",
       "frozen-direction-sequence",
       "exact-dom-wheel-contract",
       "valid-contiguous-wheel-event-coalescing",
       "missing-coalesced-wheel-delta-rejected",
+      "strict-and-bounded-diagnostic-input-policy",
       "detailed-wheel-mismatch-reasons",
       "preflight-and-post-input-environment-contract",
       "post-input-raf-first-interval",
       "midpoint-visual-response-with-final-baseline-return",
       "post-window-visual-response-without-measurement-screenshot",
       "trace-buffer-and-completeness-contract",
+      "no-trace-profile-contract",
+      "absolute-deadline-bounded-in-flight-dispatch",
     ],
   };
   console.log(JSON.stringify(result, null, 2));

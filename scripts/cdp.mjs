@@ -454,14 +454,28 @@ function selectWindowsTargetWindow(windows, expectedBounds, target) {
       eligible,
     };
   }
+  const eligibleTitledMatches = eligible.filter(
+    (candidate) =>
+      normalizedChromeWindowTitle(candidate.title) === expectedTitle,
+  );
+  if (eligibleTitledMatches.length === 1) {
+    return {
+      ok: true,
+      candidate: eligibleTitledMatches[0],
+      reason: "target-window-unique-title-fallback",
+      eligible,
+      matches,
+    };
+  }
   return {
     ok: false,
     reason:
-      matches.length > 1
+      matches.length > 1 || eligibleTitledMatches.length > 1
         ? "target-window-ambiguous"
         : "target-window-not-resolved",
     eligible,
     matches,
+    eligibleTitledMatches,
   };
 }
 
@@ -668,6 +682,231 @@ try {
   }
 }
 
+function placeWindowsWindowHandle(processId, windowHandle, requestedBounds) {
+  if (process.platform !== "win32") {
+    return { supported: false, processId, windowHandle, requestedBounds };
+  }
+  const script = String.raw`
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$processId = [int]$env:CODEX_CDP_WINDOW_PROCESS_ID
+$targetWindow = [IntPtr][long]$env:CODEX_CDP_WINDOW_HANDLE
+$left = [int]$env:CODEX_CDP_WINDOW_LEFT
+$top = [int]$env:CODEX_CDP_WINDOW_TOP
+$width = [int]$env:CODEX_CDP_WINDOW_WIDTH
+$height = [int]$env:CODEX_CDP_WINDOW_HEIGHT
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class CodexChromeWindowPlacement {
+    [StructLayout(LayoutKind.Sequential)] public struct Rect {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetWindowRect(IntPtr hWnd, out Rect rect);
+}
+"@
+if (-not [CodexChromeWindowPlacement]::IsWindow($targetWindow)) {
+    throw "Chrome target window $targetWindow is no longer valid"
+}
+$targetProcessId = [uint32]0
+[void][CodexChromeWindowPlacement]::GetWindowThreadProcessId($targetWindow, [ref]$targetProcessId)
+if ($targetProcessId -ne $processId) {
+    throw "Chrome target window $targetWindow belongs to PID $targetProcessId instead of $processId"
+}
+$flags = [uint32](0x0004 -bor 0x0010 -bor 0x0040)
+if (-not [CodexChromeWindowPlacement]::SetWindowPos($targetWindow, [IntPtr]::Zero, $left, $top, $width, $height, $flags)) {
+    throw "SetWindowPos failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+}
+$rect = New-Object CodexChromeWindowPlacement+Rect
+if (-not [CodexChromeWindowPlacement]::GetWindowRect($targetWindow, [ref]$rect)) {
+    throw "GetWindowRect failed after SetWindowPos"
+}
+[pscustomobject]@{
+    supported = $true
+    processId = $processId
+    windowHandle = [long]$targetWindow
+    flags = [int]$flags
+    foregroundActivationRequested = $false
+    bounds = [pscustomobject]@{
+        left = [int]$rect.Left
+        top = [int]$rect.Top
+        width = [int]($rect.Right - $rect.Left)
+        height = [int]($rect.Bottom - $rect.Top)
+    }
+} | ConvertTo-Json -Compress
+`;
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_CDP_WINDOW_PROCESS_ID: String(processId),
+        CODEX_CDP_WINDOW_HANDLE: String(windowHandle),
+        CODEX_CDP_WINDOW_LEFT: String(requestedBounds.left),
+        CODEX_CDP_WINDOW_TOP: String(requestedBounds.top),
+        CODEX_CDP_WINDOW_WIDTH: String(requestedBounds.width),
+        CODEX_CDP_WINDOW_HEIGHT: String(requestedBounds.height),
+      },
+      windowsHide: true,
+    },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `Unable to place dedicated Chrome window ${windowHandle} for PID ${processId}: ${(result.stderr || result.stdout || "unknown error").trim()}`,
+    );
+  }
+  try {
+    return JSON.parse(result.stdout.trim());
+  } catch (error) {
+    throw new Error(
+      `Invalid Chrome placement result for window ${windowHandle}: ${error.message}`,
+    );
+  }
+}
+
+async function placeWindowsTargetWindow(target, port, timeoutMs, requestedBounds) {
+  const browserWindow = await restoreBrowserTargetWindow(
+    target,
+    port,
+    timeoutMs,
+    { forceNormal: true },
+  );
+  const owner = inspectWindowsPortOwner(port);
+  if (
+    owner.listenerCount !== 1 ||
+    owner.localAddress !== DEFAULT_HOST ||
+    String(owner.name || "").toLowerCase() !== "chrome.exe"
+  ) {
+    throw new Error(
+      `Cannot safely place the CDP target because port ${port} is not owned by one loopback chrome.exe process.`,
+    );
+  }
+  const inspection = inspectWindowsProcessWindows(owner.processId);
+  const resolution = selectWindowsTargetWindow(
+    inspection.windows,
+    browserWindow.bounds,
+    target,
+  );
+  if (!resolution.ok) {
+    throw new Error(
+      `${resolution.reason}: no unique Chrome UI window could be resolved for exact target ${target.id}.`,
+    );
+  }
+  const version = await getJson(`http://${DEFAULT_HOST}:${port}/json/version`);
+  await sendCdp(
+    version.webSocketDebuggerUrl,
+    "Browser.setWindowBounds",
+    {
+      windowId: browserWindow.windowId,
+      bounds: requestedBounds,
+    },
+    timeoutMs,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const browserPlacementReadback = await sendCdp(
+    version.webSocketDebuggerUrl,
+    "Browser.getWindowBounds",
+    { windowId: browserWindow.windowId },
+    timeoutMs,
+  );
+  const nativePlacement = placeWindowsWindowHandle(
+    owner.processId,
+    resolution.candidate.handle,
+    requestedBounds,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const nativeReadback = inspectWindowsProcessWindows(owner.processId).windows.find(
+    (candidate) => candidate.handle === resolution.candidate.handle,
+  );
+  if (!nativeReadback) {
+    throw new Error(
+      `Placed Chrome UI window ${resolution.candidate.handle} disappeared before readback.`,
+    );
+  }
+  const cdpReadback = await sendCdp(
+    version.webSocketDebuggerUrl,
+    "Browser.getWindowForTarget",
+    { targetId: target.id },
+    timeoutMs,
+  );
+  const pageReadback = await evaluate(
+    target.webSocketDebuggerUrl,
+    `({ screenX, screenY, outerWidth, outerHeight, innerWidth, innerHeight })`,
+    timeoutMs,
+  );
+  const invalidReasons = [];
+  for (const field of ["left", "top", "width", "height"]) {
+    if (
+      Math.abs(nativeReadback[field] - requestedBounds[field]) >
+      WINDOW_BOUNDS_TOLERANCE_PX
+    ) {
+      invalidReasons.push(
+        `native-${field}:expected=${requestedBounds[field]}:actual=${nativeReadback[field]}`,
+      );
+    }
+    if (
+      Math.abs(cdpReadback.bounds?.[field] - requestedBounds[field]) >
+      WINDOW_BOUNDS_TOLERANCE_PX
+    ) {
+      invalidReasons.push(
+        `cdp-${field}:expected=${requestedBounds[field]}:actual=${cdpReadback.bounds?.[field]}`,
+      );
+    }
+  }
+  if (
+    Math.abs(pageReadback.screenX - requestedBounds.left) >
+    WINDOW_BOUNDS_TOLERANCE_PX
+  ) {
+    invalidReasons.push(
+      `page-screenX:expected=${requestedBounds.left}:actual=${pageReadback.screenX}`,
+    );
+  }
+  if (
+    Math.abs(pageReadback.screenY - requestedBounds.top) >
+    WINDOW_BOUNDS_TOLERANCE_PX
+  ) {
+    invalidReasons.push(
+      `page-screenY:expected=${requestedBounds.top}:actual=${pageReadback.screenY}`,
+    );
+  }
+  if (invalidReasons.length > 0) {
+    throw new Error(
+      `Native window placement readback failed for exact target ${target.id}: ${invalidReasons.join(" ")}`,
+    );
+  }
+  return {
+    target: { id: target.id, title: target.title, url: target.url },
+    requestedBounds,
+    resolution: {
+      method: resolution.reason,
+      candidate: resolution.candidate,
+    },
+    browserPlacement: {
+      windowId: browserWindow.windowId,
+      requestedBounds,
+      readbackBeforeNativePlacement: browserPlacementReadback.bounds,
+    },
+    nativePlacement,
+    readback: {
+      native: nativeReadback,
+      cdp: cdpReadback.bounds,
+      page: pageReadback,
+    },
+    valid: true,
+    invalidReasons: [],
+  };
+}
+
 async function activateWindowsTargetWindow(processId, browserWindow, target) {
   if (process.platform !== "win32") {
     return { supported: false, processId };
@@ -757,7 +996,12 @@ async function activateBrowserTarget(target, port, timeoutMs) {
   );
 }
 
-async function restoreBrowserTargetWindow(target, port, timeoutMs) {
+async function restoreBrowserTargetWindow(
+  target,
+  port,
+  timeoutMs,
+  { forceNormal = false } = {},
+) {
   const version = await getJson(`http://${DEFAULT_HOST}:${port}/json/version`);
   if (!version.webSocketDebuggerUrl) {
     throw new Error(
@@ -771,7 +1015,10 @@ async function restoreBrowserTargetWindow(target, port, timeoutMs) {
     timeoutMs,
   );
   let restoredBounds = bounds;
-  if (bounds?.windowState === "minimized") {
+  if (
+    bounds?.windowState === "minimized" ||
+    (forceNormal && bounds?.windowState !== "normal")
+  ) {
     await sendCdp(
       version.webSocketDebuggerUrl,
       "Browser.setWindowBounds",
@@ -932,7 +1179,11 @@ async function activateTarget(
   target,
   port,
   timeoutMs,
-  { allowFocusEmulation = true, allowWindowFocus = false } = {},
+  {
+    allowFocusEmulation = true,
+    allowWindowFocus = false,
+    bringPageToFront = true,
+  } = {},
 ) {
   const browserWindow = await restoreBrowserTargetWindow(
     target,
@@ -986,7 +1237,7 @@ async function activateTarget(
     }
   }
   await activateBrowserTarget(target, port, timeoutMs);
-  if (allowWindowFocus) {
+  if (allowWindowFocus && bringPageToFront) {
     await sendRawCdp(
       target.webSocketDebuggerUrl,
       "Page.bringToFront",
@@ -1030,7 +1281,7 @@ async function activateTarget(
     );
     focusEmulation = true;
     await activateBrowserTarget(target, port, timeoutMs);
-    if (allowWindowFocus) {
+    if (allowWindowFocus && bringPageToFront) {
       await sendRawCdp(
         target.webSocketDebuggerUrl,
         "Page.bringToFront",
@@ -3143,6 +3394,73 @@ async function resolvePoint(webSocketUrl, options, timeoutMs) {
   return { x, y };
 }
 
+function resolvedTargetSelectorForHitTest(options, point) {
+  const explicitSelector =
+    typeof options.selector === "string" ? options.selector.trim() : "";
+  if (explicitSelector) {
+    return explicitSelector;
+  }
+  const semanticSelector =
+    typeof point?.selector === "string" ? point.selector.trim() : "";
+  return semanticSelector || null;
+}
+
+function clickHitAllowsDispatch(resolvedTargetSelector, hitBefore) {
+  return (
+    resolvedTargetSelector === null ||
+    hitBefore.topWithinResolvedTarget === true
+  );
+}
+
+function hitTestExpression(point, resolvedSelector) {
+  const resolvedPoint = {
+    x: Number(point.x),
+    y: Number(point.y),
+  };
+  const selector =
+    resolvedSelector === null ? "null" : JSON.stringify(resolvedSelector);
+  return `(() => {
+        const point = ${JSON.stringify(resolvedPoint)};
+        const selector = ${selector};
+        const describe = (element) => {
+            if (!element || element.nodeType !== 1) return null;
+            const rect = element.getBoundingClientRect();
+            return {
+                tagName: element.tagName.toLowerCase(),
+                id: element.id || null,
+                className: element.getAttribute("class") || null,
+                role: element.getAttribute("role"),
+                ariaLabel: element.getAttribute("aria-label"),
+                text: (element.innerText || element.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 200),
+                bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+            };
+        };
+        const topElement = document.elementFromPoint(point.x, point.y);
+        const stackElements = document.elementsFromPoint(point.x, point.y);
+        let resolvedTargetElement = null;
+        if (selector !== null) {
+            const matches = document.querySelectorAll(selector);
+            if (matches.length !== 1) throw new Error("Resolved selector matched " + matches.length + " elements: " + selector);
+            resolvedTargetElement = matches[0];
+        }
+        return {
+            point,
+            top: describe(topElement),
+            stack: stackElements.map(describe).filter(Boolean),
+            resolvedTarget: describe(resolvedTargetElement),
+            topWithinResolvedTarget: resolvedTargetElement === null ? null : Boolean(topElement && resolvedTargetElement.contains(topElement)),
+        };
+    })()`;
+}
+
+async function readHitTest(webSocketUrl, point, resolvedSelector, timeoutMs) {
+  return evaluate(
+    webSocketUrl,
+    hitTestExpression(point, resolvedSelector),
+    timeoutMs,
+  );
+}
+
 function mouseModifiers(options) {
   let modifiers = 0;
   if (options.alt) modifiers |= 1;
@@ -4463,6 +4781,35 @@ function runSelfCheck() {
     "Chrome without background-safe flags was accepted",
   );
   assertSelfCheck(
+    resolvedTargetSelectorForHitTest(
+      { selector: "#explicit-target" },
+      { selector: "#semantic-target" },
+    ) === "#explicit-target",
+    "explicit selector was not retained for hit testing",
+  );
+  assertSelfCheck(
+    resolvedTargetSelectorForHitTest({}, { selector: "#semantic-target" }) ===
+      "#semantic-target",
+    "semantic selector was not retained for hit testing",
+  );
+  assertSelfCheck(
+    resolvedTargetSelectorForHitTest({ x: 10, y: 20 }, { x: 10, y: 20 }) ===
+      null,
+    "coordinate point incorrectly gained a resolved target",
+  );
+  assertSelfCheck(
+    clickHitAllowsDispatch("#target", { topWithinResolvedTarget: true }),
+    "selector click with a matching top hit was rejected",
+  );
+  assertSelfCheck(
+    !clickHitAllowsDispatch("#target", { topWithinResolvedTarget: false }),
+    "selector click with a mismatched top hit was accepted",
+  );
+  assertSelfCheck(
+    clickHitAllowsDispatch(null, { topWithinResolvedTarget: null }),
+    "coordinate click was incorrectly treated as a selector click",
+  );
+  assertSelfCheck(
     JSON.stringify(
       requestedOuterWindowBounds({
         left: 0,
@@ -4505,7 +4852,7 @@ function runSelfCheck() {
     ownerHandle: 0,
     visible: true,
     className: "Chrome_WidgetWin_1",
-    title: "Onshape - Google Chrome",
+    title: "Example CAD - Google Chrome",
     left: 2553,
     top: 1,
     width: 1454,
@@ -4525,15 +4872,26 @@ function runSelfCheck() {
   const resolvedWindow = selectWindowsTargetWindow(
     [auxiliaryWindow, targetWindow],
     { left: 2553, top: 1, width: 1454, height: 1263 },
-    { title: "Onshape" },
+    { title: "Example CAD" },
   );
   assertSelfCheck(
     resolvedWindow.ok === true &&
       resolvedWindow.candidate.handle === targetWindow.handle,
     "target Chrome window was not resolved from CDP bounds",
   );
+  const titleFallbackWindow = selectWindowsTargetWindow(
+    [auxiliaryWindow, targetWindow],
+    { left: 0, top: 0, width: 1454, height: 1263 },
+    { title: "Example CAD" },
+  );
   assertSelfCheck(
-    selectWindowsTargetWindow([], {}, { title: "Onshape" }).reason ===
+    titleFallbackWindow.ok === true &&
+      titleFallbackWindow.reason === "target-window-unique-title-fallback" &&
+      titleFallbackWindow.candidate.handle === targetWindow.handle,
+    "target Chrome window was not resolved by its unique full title after CDP bounds drifted",
+  );
+  assertSelfCheck(
+    selectWindowsTargetWindow([], {}, { title: "Example CAD" }).reason ===
       "interactive-desktop-unavailable",
     "missing interactive desktop was not classified",
   );
@@ -4542,9 +4900,11 @@ function runSelfCheck() {
     checks: [
       "lease-readiness",
       "background-scheduling-contract",
+      "hit-test-target-classification",
       "outer-window-bounds-shape",
       "viewport-readback-contract",
       "target-window-resolution",
+      "target-window-title-fallback",
       "interactive-desktop-classification",
     ],
   });
@@ -4555,7 +4915,7 @@ function print(value) {
 }
 
 function printHelp() {
-  process.stdout.write(`Usage: node cdp.mjs <command> [options]\n\nCommands:\n  self-check          Validate the local direct-CDP runtime\n  start [url]         Start or reuse the dedicated Chrome instance\n  status              Verify the dedicated Chrome listener and scheduling flags\n  list                List exact page targets\n  new                 Create a page, optionally in a new window\n  close               Close only an exact target returned by list/new\n  keep-alive          Hold exact targets for background-safe operations\n  keep-alive-list     List keep-alive leases\n  keep-alive-status   Read one keep-alive lease\n  keep-alive-stop     Stop one keep-alive lease and wait for cleanup\n  parallel-probe      Probe multiple exact targets without implicit activation\n  focus               Explicitly activate a target when the contract allows it\n  viewport            Set a leased target viewport and verify readback\n  viewport-check      Verify a leased target viewport\n  inspect             Inspect page controls and semantic elements\n  eval                Evaluate an expression in an exact page\n  lifecycle           Install, run, or remove a page lifecycle preload\n  heap-sampling       Start or stop V8 heap sampling on an exact page\n  cursor              Show or hide the direct-CDP cursor marker\n  move|hover          Move the pointer to a coordinate or locator\n  click               Dispatch a direct-CDP mouse click\n  drag                Dispatch a direct-CDP mouse drag\n  pointer             Dispatch mouse, pen, or touch input\n  type                Insert text through direct CDP\n  wheel-probe        Dispatch and validate trusted native wheel input\n  scroll              Scroll by evaluating page script (not benchmark input)\n  navigate            Navigate an exact target\n  reload              Reload an exact target\n  wait                Wait for a page condition\n  call                Call an arbitrary CDP method\n  screenshot          Capture an exact target screenshot\n\nGlobal options:\n  --target-exact ID   Bind commands to one exact page target\n  --timeout MS        Override the command timeout\n  --help, -h          Show this help without connecting to Chrome\n\nPerformance rule: use wheel-probe for strict input evidence and keep\ntrace/CPU/draw-call/GPU captures separate from the final KPI sample.\n`);
+  process.stdout.write(`Usage: node cdp.mjs <command> [options]\n\nCommands:\n  self-check          Validate the local direct-CDP runtime\n  start [url]         Start or reuse the dedicated Chrome instance\n  status              Verify the dedicated Chrome listener and scheduling flags\n  list                List exact page targets\n  new                 Create a page, optionally in a new window\n  close               Close only an exact target returned by list/new\n  keep-alive          Hold exact targets for background-safe operations\n  keep-alive-list     List keep-alive leases\n  keep-alive-status   Read one keep-alive lease\n  keep-alive-stop     Stop one keep-alive lease and wait for cleanup\n  parallel-probe      Probe multiple exact targets without implicit activation\n  focus               Explicitly activate a target when the contract allows it\n  window-place        Move one exact Windows target without activating it\n  viewport            Set a leased target viewport and verify readback\n  viewport-check      Verify a leased target viewport\n  inspect             Inspect page controls and semantic elements\n  hit-test            Resolve a point and report DOM hit evidence\n  eval                Evaluate an expression in an exact page\n  lifecycle           Install, run, or remove a page lifecycle preload\n  heap-sampling       Start or stop V8 heap sampling on an exact page\n  cursor              Show or hide the direct-CDP cursor marker\n  move|hover          Move the pointer to a coordinate or locator\n  click               Dispatch a direct-CDP mouse click\n  drag                Dispatch a direct-CDP mouse drag\n  pointer             Dispatch mouse, pen, or touch input\n  type                Insert text through direct CDP\n  wheel-probe         Dispatch and validate trusted native wheel input\n  scroll              Scroll by evaluating page script (not benchmark input)\n  navigate            Navigate an exact target\n  reload              Reload an exact target\n  wait                Wait for a page condition\n  call                Call an arbitrary CDP method\n  screenshot          Capture an exact target screenshot\n\nGlobal options:\n  --target-exact ID   Bind commands to one exact page target\n  --timeout MS        Override the command timeout\n  --help, -h          Show this help without connecting to Chrome\n\nWindow placement:\n  window-place requires --target-exact, --allow-window-move, and integer\n  --left, --top, --width, and --height values. It validates Win32, CDP,\n  and page readbacks and never activates the target.\n\nPerformance rule: use wheel-probe for strict input evidence and keep\ntrace/CPU/draw-call/GPU captures separate from the final KPI sample.\n`);
 }
 
 function summarizeSamplingProfile(profile, limit) {
@@ -4711,6 +5071,12 @@ async function main() {
       browser: version.Browser,
       webSocketDebuggerUrl: version.webSocketDebuggerUrl,
       pageCount: targets.length,
+      targets: targets.map(({ id, title, url, webSocketDebuggerUrl }) => ({
+        id,
+        title,
+        url,
+        webSocketDebuggerUrl,
+      })),
       backgroundScheduling: identity.backgroundScheduling,
     });
     return;
@@ -4958,6 +5324,11 @@ async function main() {
     return;
   }
   const exactTargetOption = options["target-exact"];
+  if (command === "window-place" && typeof exactTargetOption !== "string") {
+    throw new Error(
+      "Window placement requires --target-exact <target ID>; use the ID returned by list.",
+    );
+  }
   if (
     options.target &&
     typeof exactTargetOption === "string" &&
@@ -5001,6 +5372,27 @@ async function main() {
     });
     return;
   }
+  if (command === "window-place") {
+    if (optionalBooleanOption(options, "allow-window-move") !== true) {
+      throw new Error(
+        "Window placement requires --allow-window-move because it changes the existing Chrome window geometry.",
+      );
+    }
+    const requestedBounds = {
+      left: integerOption(options, "left", undefined, -32768, 32767),
+      top: integerOption(options, "top", undefined, -32768, 32767),
+      width: integerOption(options, "width", undefined, 200, 32768),
+      height: integerOption(options, "height", undefined, 200, 32768),
+    };
+    const placement = await placeWindowsTargetWindow(
+      target,
+      port,
+      timeoutMs,
+      requestedBounds,
+    );
+    print(placement);
+    return;
+  }
   const pointerCommand = [
     "cursor",
     "move",
@@ -5018,6 +5410,7 @@ async function main() {
     activation = await activateTarget(target, port, timeoutMs, {
       allowFocusEmulation: !options["no-focus-emulation"],
       allowWindowFocus: Boolean(options["allow-window-focus"]),
+      bringPageToFront: !options["no-page-bring-to-front"],
     });
   }
 
@@ -5025,6 +5418,7 @@ async function main() {
     activation ??= await activateTarget(target, port, timeoutMs, {
       allowFocusEmulation: !options["no-focus-emulation"],
       allowWindowFocus: Boolean(options["allow-window-focus"]),
+      bringPageToFront: !options["no-page-bring-to-front"],
     });
     print({
       target: { id: target.id, title: target.title, url: target.url },
@@ -5227,6 +5621,25 @@ async function main() {
     return;
   }
 
+  if (command === "hit-test") {
+    const point = await resolvePoint(
+      target.webSocketDebuggerUrl,
+      options,
+      timeoutMs,
+    );
+    const hitTest = await readHitTest(
+      target.webSocketDebuggerUrl,
+      point,
+      resolvedTargetSelectorForHitTest(options, point),
+      timeoutMs,
+    );
+    print({
+      target: { id: target.id, title: target.title, url: target.url },
+      hitTest,
+    });
+    return;
+  }
+
   if (command === "cursor") {
     if (options.hide) {
       const result = await evaluate(
@@ -5263,10 +5676,26 @@ async function main() {
       options,
       timeoutMs,
     );
+    const resolvedTargetSelector = resolvedTargetSelectorForHitTest(
+      options,
+      point,
+    );
+    const hitBefore = await readHitTest(
+      target.webSocketDebuggerUrl,
+      point,
+      resolvedTargetSelector,
+      timeoutMs,
+    );
+    if (!clickHitAllowsDispatch(resolvedTargetSelector, hitBefore)) {
+      throw new Error(
+        `Selector click was not dispatched because its resolved target was not the top hit element: ${JSON.stringify(hitBefore)}`,
+      );
+    }
     await dispatchClick(target.webSocketDebuggerUrl, point, options, timeoutMs);
     print({
       target: { id: target.id, title: target.title, url: target.url },
       clicked: point,
+      hitBefore,
       input: {
         button: mouseButton(options),
         modifiers: mouseModifiers(options),

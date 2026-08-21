@@ -1,6 +1,6 @@
 ---
 name: chrome-browser-lab
-description: Coordinate reliable Chrome browser testing, debugging, WebGL inspection, user-input control, screenshots, network investigation, and performance evidence. Use when a task needs an exact Chrome target, a signed-in page, Onshape inspection, repeatable browser gates, or a decision about whether a frame-rate result is trustworthy.
+description: Coordinate reliable Chrome browser testing, debugging, WebGL inspection, user-input control, screenshots, network investigation, and performance evidence. Use when a task needs an exact Chrome target, a signed-in page, repeatable browser gates, or a decision about whether a frame-rate result is trustworthy.
 ---
 
 # Chrome Browser Lab
@@ -30,6 +30,12 @@ Use `scripts/cdp.mjs` for:
 - strict wheel evidence and commands that must not silently select another tab.
   `Target.activateTarget` is never implicit, and `--allow-window-focus` is an
   explicit opt-in for a foreground experiment.
+
+Use the `windows-native` backend in `scripts/wheel-benchmark.mjs` or a
+configured `compare-wheel.mjs --config <scenario.json>` workflow when a page
+must receive the same physical Windows wheel path as a user-operated browser.
+That backend verifies the exact foreground Chrome window and render widget;
+therefore compared targets run sequentially, never simultaneously.
 
 Use `scripts/capture-trace.mjs` and `scripts/analyze-trace.mjs` when a saved,
 reviewable trace is required or when a performance result must be attributed to
@@ -66,19 +72,36 @@ Treat performance as an attribution exercise, not a single FPS number.
 1. Freeze the test contract: same canvas CSS size, DPR, camera/view, model
    anchor, warm-up, input deltas, input count, interval, direction, duration,
    and reload/fit state on every target.
-2. Use direct CDP `wheel-probe` or pointer commands to prove that input is
-   native CDP input, trusted in the page, received by the intended viewport,
-   and causes the expected visual response.
-3. Capture a Chrome trace with `capture-trace.mjs` during the same interaction.
-   Keep trace capture separate from the final KPI sample because tracing adds
-   overhead.
+2. Use direct CDP `wheel-probe` for general pages, or verified Windows native
+   wheel input for the maintained CAD comparison, to prove trusted delivery to
+   the intended viewport and the expected visual response.
+3. Capture a Chrome trace during the same interaction when numeric browser
+   display cadence is required. Keep CPU profiles and heavier instrumentation
+   in separate runs, and use the same trace profile on both compared targets.
 4. Analyze the trace with `analyze-trace.mjs`. It reports Chrome compositor
-   draw/swap FPS separately from final display Present FPS. Use
-   `present-fps.mjs wheel` when the final display surface is the KPI.
+   draw/swap cadence separately from target-correlated
+   `Display::FrameDisplayed` cadence. PresentMon is optional and is needed only
+   for an independent Windows ETW/DWM measurement outside Chrome's trace.
 5. Run CPU profile, draw-call instrumentation, and GPU/WPR/GPUView captures as
    separate samples. Attribute the slow frame before changing production code.
 6. Repeat both targets in alternating order and compare distributions, not one
    favorable run. Preserve invalid samples and their reasons.
+
+For repeatable two-target comparisons, keep application-specific URLs,
+readiness expressions, and setup actions in a scenario JSON outside the
+plugin, then use:
+
+```powershell
+node scripts/compare-wheel.mjs --config <absolute-scenario.json> --output-dir <evidence-dir>
+```
+
+The scenario controls sample duration, trace profile, native overlay state,
+readiness, Canvas normalization, camera/setup actions, and exact target URLs.
+The runner rejects missing or ambiguous targets instead of guessing by site or
+title. Use `--prepare-only` for a no-input fresh-state gate and `--rounds 3`
+for an alternating comparison distribution. For a one-round prepared-state
+sample, pass `--reuse-ready-state` only with empty setup action arrays and
+report it separately from a fresh-reload comparison.
 
 `requestAnimationFrame` counts are scheduler diagnostics. `Page.screencast`
 frames are visual-update evidence. Neither is GPU Present FPS. See
