@@ -83,6 +83,65 @@ const LEGACY_MOUSEWHEEL_BRIDGE_SOURCE =
 const INPUT_DELIVERY_POLICIES = new Set(["strict", "diagnostic"]);
 const SOFT_INPUT_CAPTURE_REASON =
   /^(dom-wheel-event-count-mismatch|dom-wheel-delta-y-sequence-mismatch|legacy-wheel-handler-count-mismatch|dom-wheel-timing-out-of-contract):/;
+const WHEEL_PROBE_LISTENER_SCOPE = Object.freeze({
+  target: "window",
+  phase: "capture",
+});
+const INPUT_OBSERVATION_SAMPLE_LIMIT = 20;
+
+function classifyWheelObservation(event, canvas, frozenRect, frozenPoint) {
+  const path =
+    typeof event.composedPath === "function" ? event.composedPath() : [];
+  const pathContainsCanvas = path.includes(canvas);
+  const coordinatesInsideCanvas =
+    event.clientX >= frozenRect.x &&
+    event.clientX < frozenRect.x + frozenRect.width &&
+    event.clientY >= frozenRect.y &&
+    event.clientY < frozenRect.y + frozenRect.height;
+  const coordinatesMatchFrozenPoint =
+    event.clientX === frozenPoint.x && event.clientY === frozenPoint.y;
+  const rejectReasons = [];
+  if (event.isTrusted !== true) rejectReasons.push("event-not-trusted");
+  if (!pathContainsCanvas) rejectReasons.push("composed-path-missing-frozen-canvas");
+  if (!coordinatesInsideCanvas)
+    rejectReasons.push("coordinates-outside-frozen-canvas");
+  if (!coordinatesMatchFrozenPoint)
+    rejectReasons.push("coordinates-do-not-match-frozen-point");
+  const describeTarget = (target) => {
+    if (target === globalThis) return "WINDOW";
+    if (target?.nodeType === 9) return "DOCUMENT";
+    const tagName = target?.tagName || target?.constructor?.name || null;
+    if (!tagName) return null;
+    const id = target?.id ? `#${target.id}` : "";
+    const className =
+      typeof target?.className === "string" && target.className.trim().length > 0
+        ? `.${target.className.trim().split(/\s+/).join(".")}`
+        : "";
+    return `${tagName}${id}${className}`;
+  };
+  return {
+    accepted: rejectReasons.length === 0,
+    rejectReasons,
+    checks: {
+      isTrusted: event.isTrusted === true,
+      composedPathContainsFrozenCanvas: pathContainsCanvas,
+      coordinatesInsideFrozenCanvas: coordinatesInsideCanvas,
+      coordinatesMatchFrozenPoint,
+    },
+    event: {
+      time: typeof performance?.now === "function" ? performance.now() : null,
+      type: event.type || "wheel",
+      isTrusted: event.isTrusted === true,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      deltaMode: event.deltaMode,
+      target: describeTarget(event.target),
+      composedPath: path.map(describeTarget).filter(Boolean),
+    },
+  };
+}
 
 function parseArgs(argv) {
   const options = {};
@@ -426,6 +485,7 @@ async function installProbe(
   return evaluate(
     session,
     `(() => {
+      const classifyWheelObservation = ${classifyWheelObservation.toString()};
       const canvases = [...document.querySelectorAll("canvas")]
         .map((canvas) => ({ canvas, rect: canvas.getBoundingClientRect() }))
         .filter(({ rect }) => rect.width > 0 && rect.height > 0)
@@ -444,6 +504,25 @@ async function installProbe(
           : "null";
         throw new Error("Wheel input point is blocked; expected the largest canvas but elementFromPoint resolved " + targetDescription + ".");
       }
+      const frozenRect = {
+        x: candidate.rect.x,
+        y: candidate.rect.y,
+        width: candidate.rect.width,
+        height: candidate.rect.height,
+      };
+      const frozenPoint = {
+        x: ${JSON.stringify(point.x)},
+        y: ${JSON.stringify(point.y)},
+      };
+      const createObservationChannel = (contributesToTrustedInput, contributesToInputLatencyKpi) => ({
+        observedCount: 0,
+        acceptedCount: 0,
+        filteredCount: 0,
+        filteredReasonCounts: {},
+        samples: [],
+        contributesToTrustedInput,
+        contributesToInputLatencyKpi,
+      });
       const state = {
         wheelEvents: [],
         legacyMousewheelEvents: [],
@@ -461,9 +540,54 @@ async function installProbe(
         legacyMousewheelBridge: null,
         onError: null,
         onRejection: null,
+        inputObservation: {
+          schemaVersion: 1,
+          listener: {
+            target: ${JSON.stringify(WHEEL_PROBE_LISTENER_SCOPE.target)},
+            phase: ${JSON.stringify(WHEEL_PROBE_LISTENER_SCOPE.phase)},
+          },
+          acceptedWheelContract: {
+            isTrusted: true,
+            composedPathContainsFrozenCanvas: true,
+            coordinatesInsideFrozenCanvas: true,
+            coordinatesMatchFrozenPoint: true,
+          },
+          frozenTarget: {
+            tagName: candidate.canvas.tagName,
+            id: candidate.canvas.id || null,
+            className: typeof candidate.canvas.className === "string" ? candidate.canvas.className : null,
+            rect: frozenRect,
+            point: frozenPoint,
+          },
+          channels: {
+            nativeWheel: createObservationChannel(true, true),
+            browserMousewheel: createObservationChannel(false, false),
+            pluginRelayMousewheel: createObservationChannel(false, false),
+          },
+        },
       };
       state.onWheel = (event) => {
-        const now = performance.now();
+        const observation = classifyWheelObservation(
+          event,
+          candidate.canvas,
+          frozenRect,
+          frozenPoint,
+        );
+        const channel = state.inputObservation.channels.nativeWheel;
+        channel.observedCount += 1;
+        if (channel.samples.length < ${INPUT_OBSERVATION_SAMPLE_LIMIT}) {
+          channel.samples.push(observation);
+        }
+        if (!observation.accepted) {
+          channel.filteredCount += 1;
+          for (const reason of observation.rejectReasons) {
+            channel.filteredReasonCounts[reason] =
+              (channel.filteredReasonCounts[reason] || 0) + 1;
+          }
+          return;
+        }
+        channel.acceptedCount += 1;
+        const now = observation.event.time;
         if (${traceMarkersEnabled ? "true" : "false"} && state.wheelEvents.length === 0) {
           performance.mark(${JSON.stringify(TRACE_WHEEL_START_MARKER)});
           console.timeStamp(${JSON.stringify(TRACE_WHEEL_START_MARKER)});
@@ -482,7 +606,10 @@ async function installProbe(
         });
       };
       state.onMousewheel = (event) => {
-        state.legacyMousewheelEvents.push({
+        const source = state.relayedLegacyEvents.has(event)
+          ? "plugin-relay"
+          : "browser";
+        const observedEvent = {
           time: performance.now(),
           deltaX: event.deltaX,
           deltaY: event.deltaY,
@@ -495,10 +622,17 @@ async function installProbe(
           clientY: event.clientY,
           defaultPrevented: event.defaultPrevented,
           targetTag: event.target?.tagName || null,
-          source: state.relayedLegacyEvents.has(event)
-            ? "plugin-relay"
-            : "browser",
-        });
+          source,
+        };
+        state.legacyMousewheelEvents.push(observedEvent);
+        const channel = source === "plugin-relay"
+          ? state.inputObservation.channels.pluginRelayMousewheel
+          : state.inputObservation.channels.browserMousewheel;
+        channel.observedCount += 1;
+        channel.acceptedCount += 1;
+        if (channel.samples.length < ${INPUT_OBSERVATION_SAMPLE_LIMIT}) {
+          channel.samples.push(observedEvent);
+        }
       };
       if (${useLegacyMousewheelBridge ? "true" : "false"}) {
         state.legacyMousewheelBridge = { relayEvents: [] };
@@ -552,8 +686,8 @@ async function installProbe(
       state.onRejection = (event) => state.pageErrors.push(String(event.reason || "unhandled rejection"));
       addEventListener("error", state.onError);
       addEventListener("unhandledrejection", state.onRejection);
-      candidate.canvas.addEventListener("wheel", state.onWheel, true);
-      candidate.canvas.addEventListener("mousewheel", state.onMousewheel, true);
+      window.addEventListener("wheel", state.onWheel, true);
+      window.addEventListener("mousewheel", state.onMousewheel, true);
       if (typeof PerformanceObserver === "function") {
         try {
           state.observer = new PerformanceObserver((list) => {
@@ -567,14 +701,24 @@ async function installProbe(
         state.rafHandle = requestAnimationFrame(tick);
       };
       state.rafHandle = requestAnimationFrame(tick);
-      globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__ = { state, canvas: candidate.canvas, rect: candidate.rect };
+      globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__ = {
+        state,
+        canvas: candidate.canvas,
+        rect: frozenRect,
+        point: frozenPoint,
+      };
       return {
-        rect: { x: candidate.rect.x, y: candidate.rect.y, width: candidate.rect.width, height: candidate.rect.height },
+        rect: frozenRect,
         drawingBuffer: { width: candidate.canvas.width, height: candidate.canvas.height },
         dpr: devicePixelRatio,
         viewport: { width: innerWidth, height: innerHeight },
         visibilityState: document.visibilityState,
         readyState: document.readyState,
+        inputObservation: {
+          listener: state.inputObservation.listener,
+          acceptedWheelContract: state.inputObservation.acceptedWheelContract,
+          frozenTarget: state.inputObservation.frozenTarget,
+        },
       };
     })()`,
   );
@@ -587,15 +731,37 @@ async function disposeProbe(session) {
       const probe = globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__;
       if (!probe) return { existed: false, residue: false };
       const { state, canvas } = probe;
-      cancelAnimationFrame(state.rafHandle);
-      canvas.removeEventListener("wheel", state.onWheel, true);
-      canvas.removeEventListener("mousewheel", state.onMousewheel, true);
+      const cleanup = { attempted: true, completed: [], errors: [] };
+      const attempt = (name, action) => {
+        try {
+          action();
+          cleanup.completed.push(name);
+        } catch (error) {
+          cleanup.errors.push({
+            name,
+            message: String(error?.stack || error?.message || error),
+          });
+        }
+      };
+      attempt("cancel-animation-frame", () => cancelAnimationFrame(state.rafHandle));
+      attempt("remove-window-wheel-capture", () =>
+        window.removeEventListener("wheel", state.onWheel, true),
+      );
+      attempt("remove-window-mousewheel-capture", () =>
+        window.removeEventListener("mousewheel", state.onMousewheel, true),
+      );
       if (state.onLegacyMousewheelBridge) {
-        canvas.removeEventListener("wheel", state.onLegacyMousewheelBridge);
+        attempt("remove-canvas-legacy-relay", () =>
+          canvas.removeEventListener("wheel", state.onLegacyMousewheelBridge),
+        );
       }
-      removeEventListener("error", state.onError);
-      removeEventListener("unhandledrejection", state.onRejection);
-      state.observer?.disconnect();
+      attempt("remove-window-error", () =>
+        removeEventListener("error", state.onError),
+      );
+      attempt("remove-window-unhandledrejection", () =>
+        removeEventListener("unhandledrejection", state.onRejection),
+      );
+      attempt("disconnect-long-task-observer", () => state.observer?.disconnect());
       const rect = canvas.getBoundingClientRect();
       const snapshot = {
         wheelEvents: state.wheelEvents,
@@ -603,6 +769,7 @@ async function disposeProbe(session) {
         rafTimestamps: state.rafTimestamps,
         longTasks: state.longTasks,
         pageErrors: state.pageErrors,
+        inputObservation: state.inputObservation,
         legacyMousewheelBridge: state.legacyMousewheelBridge,
         firstInput: state.firstInput,
         lastInput: state.lastInput,
@@ -613,8 +780,13 @@ async function disposeProbe(session) {
           drawingBuffer: { width: canvas.width, height: canvas.height },
         },
       };
-      delete globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__;
-      return { existed: true, residue: globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__ !== undefined, snapshot };
+      attempt("delete-global-probe", () => {
+        delete globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__;
+      });
+      const residue = globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__ !== undefined;
+      cleanup.residue = residue;
+      cleanup.complete = cleanup.errors.length === 0 && residue === false;
+      return { existed: true, residue, snapshot, cleanup };
     })()`,
   );
 }
@@ -632,12 +804,75 @@ async function resetProbeForMeasurement(session) {
       state.longTasks.length = 0;
       state.firstInput = null;
       state.lastInput = null;
+      for (const channel of Object.values(state.inputObservation.channels)) {
+        channel.observedCount = 0;
+        channel.acceptedCount = 0;
+        channel.filteredCount = 0;
+        channel.filteredReasonCounts = {};
+        channel.samples.length = 0;
+      }
       if (state.legacyMousewheelBridge) {
         state.legacyMousewheelBridge.relayEvents.length = 0;
       }
       return { resetAt: performance.now() };
     })()`,
   );
+}
+
+async function readProbeEnvironment(session) {
+  return evaluate(
+    session,
+    `(() => {
+      const probe = globalThis.__CHROME_DEVTOOLS_LAB_WHEEL__;
+      if (!probe) throw new Error("Wheel probe is not installed");
+      const rect = probe.canvas.getBoundingClientRect();
+      const pointTarget = document.elementFromPoint(probe.point.x, probe.point.y);
+      return {
+        environment: {
+          dpr: devicePixelRatio,
+          viewport: { width: innerWidth, height: innerHeight },
+          canvasRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          drawingBuffer: { width: probe.canvas.width, height: probe.canvas.height },
+        },
+        point: probe.point,
+        pointInsideCanvas:
+          probe.point.x >= rect.x &&
+          probe.point.x < rect.x + rect.width &&
+          probe.point.y >= rect.y &&
+          probe.point.y < rect.y + rect.height,
+        pointTargetMatchesCanvas: pointTarget === probe.canvas,
+        visibilityState: document.visibilityState,
+      };
+    })()`,
+  );
+}
+
+function validatePostFocusEnvironment(readback, frozenEnvironment) {
+  const comparison = compareEnvironmentContract(
+    readback.environment,
+    frozenEnvironment,
+  );
+  const invalidReasons = comparison.mismatches.map(
+    (mismatch) =>
+      `${mismatch.field}:expected=${mismatch.expected}:actual=${mismatch.actual}`,
+  );
+  if (readback.pointInsideCanvas !== true)
+    invalidReasons.push("frozen-point-outside-canvas");
+  if (readback.pointTargetMatchesCanvas !== true)
+    invalidReasons.push("frozen-point-no-longer-targets-canvas");
+  if (readback.visibilityState !== "visible")
+    invalidReasons.push(`visibility-state:${readback.visibilityState}`);
+  return {
+    frozen: frozenEnvironment,
+    actual: readback.environment,
+    matches: invalidReasons.length === 0,
+    mismatches: comparison.mismatches,
+    invalidReasons,
+    point: readback.point,
+    pointInsideCanvas: readback.pointInsideCanvas === true,
+    pointTargetMatchesCanvas: readback.pointTargetMatchesCanvas === true,
+    visibilityState: readback.visibilityState,
+  };
 }
 
 async function readTraceStream(session, handle) {
@@ -661,6 +896,45 @@ async function readTraceStream(session, handle) {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function serializeError(error) {
+  if (error === null || error === undefined) return null;
+  return {
+    name: error?.name || "Error",
+    message: error?.message || String(error),
+    stack: error?.stack || null,
+  };
+}
+
+async function invokeCleanupOnce(state, cleanup) {
+  if (state.started !== true || state.attempted === true) return state.result;
+  state.attempted = true;
+  try {
+    state.result = await cleanup();
+    return state.result;
+  } catch (error) {
+    state.error = serializeError(error);
+    const cleanupError = new Error(
+      `Wheel probe cleanup failed: ${error?.message || String(error)}`,
+      { cause: error },
+    );
+    cleanupError.isProbeCleanupError = true;
+    throw cleanupError;
+  }
+}
+
+function probeCleanupContractError(disposed) {
+  if (!disposed || disposed.existed !== true) return null;
+  if (disposed.residue === false && disposed.cleanup?.complete === true) {
+    return null;
+  }
+  return new Error(
+    `Wheel probe cleanup was incomplete: ${JSON.stringify({
+      residue: disposed.residue,
+      cleanup: disposed.cleanup || null,
+    })}`,
+  );
 }
 
 async function waitForProbeWheelDelivery(session, expectedCount, timeoutMs) {
@@ -902,9 +1176,11 @@ function validatePostFocusPlacement(
 }
 
 async function dispatchNativeWheelSequence({
+  session,
   target,
   port,
   page,
+  frozenEnvironment,
   expectedEvents,
   durationMs,
   timeoutMs,
@@ -931,6 +1207,16 @@ async function dispatchNativeWheelSequence({
         resolvedFocus,
         page,
       );
+  const postFocusEnvironmentReadback = await readProbeEnvironment(session);
+  const postFocusEnvironment = validatePostFocusEnvironment(
+    postFocusEnvironmentReadback,
+    frozenEnvironment,
+  );
+  if (!postFocusEnvironment.matches) {
+    throw new Error(
+      `Post-focus environment changed before native wheel dispatch; sentCount=0 ${postFocusEnvironment.invalidReasons.join(" ")}`,
+    );
+  }
   const nativeEvents = expectedEvents.map((event) => ({
     offsetMilliseconds: event.offsetMilliseconds,
     deltaY: event.nativeDeltaY ?? event.deltaY,
@@ -967,6 +1253,7 @@ async function dispatchNativeWheelSequence({
       backend: "windows-SendInput",
       processId,
       focus: resolvedFocus,
+      postFocusEnvironment,
       postFocusPlacement,
       screenPoint: native.screenPoint,
       cursorLockedDuringDispatch:
@@ -980,6 +1267,7 @@ async function dispatchNativeWheelSequence({
       requestedCount: native.requestedCount,
       elapsedMilliseconds: native.elapsedMilliseconds,
       maximumScheduleErrorMilliseconds: native.maximumScheduleErrorMilliseconds,
+      targeting: native.targeting || null,
     },
   };
 }
@@ -1191,6 +1479,20 @@ function compareEnvironmentContract(actual, expected) {
       expected.canvasRect.height,
     ],
   ];
+  if (expected.drawingBuffer !== undefined) {
+    comparisons.push(
+      [
+        "drawingBuffer.width",
+        actual.drawingBuffer?.width,
+        expected.drawingBuffer.width,
+      ],
+      [
+        "drawingBuffer.height",
+        actual.drawingBuffer?.height,
+        expected.drawingBuffer.height,
+      ],
+    );
+  }
   const mismatches = comparisons
     .filter(([, actualValue, expectedValue]) => actualValue !== expectedValue)
     .map(([field, actualValue, expectedValue]) => ({
@@ -1581,6 +1883,7 @@ function summarizeProbe(
       0,
     ),
     pageErrors: snapshot.pageErrors,
+    inputObservation: snapshot.inputObservation || null,
     postInputFrames: postFrames,
   };
 }
@@ -1729,8 +2032,28 @@ async function main(options) {
         eventCount:
           typeof params.eventCount === "number" ? params.eventCount : null,
       });
-    });
+      });
   }
+  const probeLifecycle = {
+    started: false,
+    attempted: false,
+    result: null,
+    error: null,
+  };
+  let disposed = null;
+  let primaryError = null;
+  const cleanupProbe = async () => {
+    const result = await invokeCleanupOnce(
+      probeLifecycle,
+      () => disposeProbe(session),
+    );
+    if (result !== null && result !== undefined) {
+      disposed = result;
+      const contractError = probeCleanupContractError(result);
+      if (contractError) throw contractError;
+    }
+    return result;
+  };
   try {
     if (showFpsCounter) {
       await setNativeFpsCounter(session, true);
@@ -1742,6 +2065,7 @@ async function main(options) {
     );
     target.title = page.title;
     target.url = page.url;
+    probeLifecycle.started = true;
     const preflight = await installProbe(
       session,
       useLegacyMousewheelBridge,
@@ -1810,9 +2134,11 @@ async function main(options) {
     );
     const dispatch = inputBackend === "windows-native"
       ? await dispatchNativeWheelSequence({
+          session,
           target,
           port,
           page,
+          frozenEnvironment: normalizePreflightEnvironment(preflight),
           expectedEvents,
           durationMs,
           timeoutMs,
@@ -1856,11 +2182,12 @@ async function main(options) {
       WHEEL_DELIVERY_WAIT_MAX_MS,
     );
     const afterHash = await captureCanvasHash(session, canvas);
-    const disposed = await disposeProbe(session);
+    await cleanupProbe();
     let complete = null;
     let trace = null;
     if (traceSession !== null) {
       await traceSession.send("Tracing.end");
+      tracingStarted = false;
       await evaluate(
         session,
         `performance.clearMarks(${JSON.stringify(TRACE_WHEEL_START_MARKER)}); performance.clearMarks(${JSON.stringify(TRACE_WHEEL_END_MARKER)})`,
@@ -1975,12 +2302,60 @@ async function main(options) {
       fpsCounter.heldForMilliseconds = fpsCounterHoldMs;
     }
     const invalidReasons = [];
+    const nativeWheelObservation =
+      diagnostics.inputObservation?.channels?.nativeWheel || null;
+    if (nativeWheelObservation === null) {
+      addInvalidReason(
+        invalidReasons,
+        "wheel-observation-channel-missing",
+        "nativeWheel channel was not installed",
+      );
+    } else {
+      if (nativeWheelObservation.acceptedCount !== diagnostics.receivedEventCount) {
+        addInvalidReason(
+          invalidReasons,
+          "wheel-observation-count-mismatch",
+          `accepted=${nativeWheelObservation.acceptedCount} recorded=${diagnostics.receivedEventCount}`,
+        );
+      }
+      if (nativeWheelObservation.filteredCount > 0) {
+        addInvalidReason(
+          invalidReasons,
+          "wheel-observation-filtered-events",
+          `filtered=${nativeWheelObservation.filteredCount} reasons=${JSON.stringify(nativeWheelObservation.filteredReasonCounts)}`,
+        );
+      }
+    }
     if (dispatch.dispatchAcks !== count) {
       addInvalidReason(
         invalidReasons,
         "cdp-wheel-ack-count-mismatch",
         `expected=${count} actual=${dispatch.dispatchAcks}`,
       );
+    }
+    if (inputBackend === "windows-native") {
+      const nativeInput = dispatch.nativeInput || null;
+      if (nativeInput?.targeting?.winnerCount !== 1) {
+        addInvalidReason(
+          invalidReasons,
+          "native-targeting-contract-mismatch",
+          `winnerCount=${nativeInput?.targeting?.winnerCount ?? "missing"}`,
+        );
+      }
+      if (nativeInput?.targeting?.dispatchRecheck?.passed !== true) {
+        addInvalidReason(
+          invalidReasons,
+          "native-dispatch-recheck-missing-or-failed",
+          JSON.stringify(nativeInput?.targeting?.dispatchRecheck || null),
+        );
+      }
+      if (nativeInput?.postFocusEnvironment?.matches !== true) {
+        addInvalidReason(
+          invalidReasons,
+          "native-post-focus-environment-mismatch",
+          JSON.stringify(nativeInput?.postFocusEnvironment || null),
+        );
+      }
     }
     appendWheelContractInvalidReasons(
       invalidReasons,
@@ -2236,24 +2611,61 @@ async function main(options) {
       );
     }
     console.log(JSON.stringify(result, null, 2));
+  } catch (error) {
+    primaryError = error;
   } finally {
+    const cleanupErrors = [];
+    if (probeLifecycle.started && probeLifecycle.attempted !== true) {
+      try {
+        await cleanupProbe();
+      } catch (error) {
+        cleanupErrors.push({ label: "probe", error });
+      }
+    }
     if (tracingStarted) {
       try {
         await traceSession?.send("Tracing.end");
-      } catch {}
+        tracingStarted = false;
+      } catch (error) {
+        cleanupErrors.push({ label: "tracing-end", error });
+      }
     }
     if (traceLock) {
       try {
         await traceLock.release();
-      } catch {}
+        traceLock = null;
+      } catch (error) {
+        cleanupErrors.push({ label: "trace-lock-release", error });
+      }
     }
-    if (showFpsCounter) {
+    if (showFpsCounter && fpsCounter.enabled) {
       try {
         await setNativeFpsCounter(session, false);
-      } catch {}
+        fpsCounter.enabled = false;
+      } catch (error) {
+        cleanupErrors.push({ label: "fps-overlay-disable", error });
+      }
     }
     traceSession?.close();
     session.close();
+    if (primaryError !== null || cleanupErrors.length > 0) {
+      const parts = [];
+      if (primaryError !== null) {
+        parts.push(`PrimaryError=${primaryError?.stack || primaryError?.message || primaryError}`);
+      }
+      for (const entry of cleanupErrors) {
+        parts.push(`CleanupError[${entry.label}]=${entry.error?.stack || entry.error?.message || entry.error}`);
+      }
+      const combined = new Error(parts.join("\n"), {
+        cause: primaryError || cleanupErrors[0]?.error,
+      });
+      combined.primaryError = serializeError(primaryError);
+      combined.cleanupErrors = cleanupErrors.map((entry) => ({
+        label: entry.label,
+        error: serializeError(entry.error),
+      }));
+      throw combined;
+    }
   }
 }
 
