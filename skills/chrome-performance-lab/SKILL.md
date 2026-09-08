@@ -15,7 +15,7 @@ Keep these layers separate:
 | Layer            | Tool                                       | What it proves                                                   |
 | ---------------- | ------------------------------------------ | ---------------------------------------------------------------- |
 | Input            | direct CDP `wheel-probe`, `pointer`        | exact target, native CDP event, trusted delivery                 |
-| Page diagnostics | MCP console/network/snapshot               | page state, errors, requests, DOM/UI state                       |
+| Page diagnostics | MCP console/network/snapshot plus page runtime snapshot | page state, errors, requests, DOM/UI state, heap/DOM/resource/runtime deltas |
 | CPU              | MCP performance tools or a V8 profile      | JavaScript and renderer CPU attribution                          |
 | Trace            | `capture-trace.mjs` + `analyze-trace.mjs`  | compositor work and target-correlated browser display cadence    |
 | System GPU       | WPR/GPUView                                | queue, GPU scheduling, Present/DWM attribution                   |
@@ -167,8 +167,9 @@ samples that violate any part of the contract instead of averaging them in.
    it does not invalidate already qualified Chrome trace presentation data and
    is never replaced with rAF or compositor cadence.
 
-5. Inspect top long tasks, compositor/GPU event counts, frame interval
-   distribution, and missing evidence. Only then choose a code path to inspect.
+5. Inspect input delivery, page runtime deltas, top long tasks,
+   compositor/GPU event counts, frame interval distributions, trace integrity,
+   and missing evidence. Only then choose a code path to inspect.
 6. Run CPU, draw-call, and system GPU captures as separate follow-up samples.
 7. Preserve raw trace, summary, contract, invalid reasons, and exact commands
    as evidence. Never overwrite an earlier sample with a rerun.

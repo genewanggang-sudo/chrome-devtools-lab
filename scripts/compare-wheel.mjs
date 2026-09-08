@@ -48,7 +48,15 @@ const DEFAULT_SAMPLE = Object.freeze({
 });
 const DEFAULT_RETRY_POLICY = Object.freeze({
   maxInputRetries: 2,
+  maxPreparationRetries: 0,
   durationBackoffMultiplier: 2,
+});
+const DEFAULT_METRIC_PROFILE = Object.freeze({
+  profile: "cad-render-v1",
+  pageRuntime: true,
+  trace: true,
+  webgl: "optional",
+  systemGpu: "optional",
 });
 const FPS_TRACE_PROFILE = "fps";
 const FPS_MINIMAL_TRACE_PROFILE = "fps-minimal";
@@ -265,6 +273,7 @@ class ComparisonConfig {
     this.targets = value.targets;
     this.environment = value.environment;
     this.execution = value.execution;
+    this.metrics = value.metrics;
   }
 
   static async load(filePath) {
@@ -319,6 +328,7 @@ class ComparisonConfig {
           cli.reuseReadyState ?? config.execution.reuseReadyState,
         prepareOnly: cli.prepareOnly ?? config.execution.prepareOnly,
       },
+      metrics: config.metrics,
       targets: config.targets,
     });
   }
@@ -329,7 +339,7 @@ class ComparisonConfig {
     }
     ValueChecks.allowedKeys(
       raw,
-      ["schemaVersion", "sample", "retry", "targets", "environment", "execution"],
+      ["schemaVersion", "sample", "retry", "targets", "environment", "execution", "metrics"],
       "Config",
     );
     if (raw.schemaVersion !== CONFIG_SCHEMA_VERSION) {
@@ -347,6 +357,7 @@ class ComparisonConfig {
     );
     const environment = ComparisonConfig.normalizeEnvironment(raw.environment);
     const execution = ComparisonConfig.normalizeExecution(raw.execution);
+    const metrics = ComparisonConfig.normalizeMetrics(raw.metrics);
     const names = new Set();
     const urls = new Set();
     for (const target of targets) {
@@ -368,6 +379,47 @@ class ComparisonConfig {
       targets,
       environment,
       execution,
+      metrics,
+    };
+  }
+
+  static normalizeMetrics(rawMetrics) {
+    if (rawMetrics !== undefined && !ValueChecks.isObject(rawMetrics)) {
+      throw new ConfigurationError("metrics must be an object.");
+    }
+    const raw = rawMetrics || {};
+    ValueChecks.allowedKeys(
+      raw,
+      Object.keys(DEFAULT_METRIC_PROFILE),
+      "metrics",
+    );
+    const profile = ValueChecks.string(
+      raw.profile === undefined ? DEFAULT_METRIC_PROFILE.profile : raw.profile,
+      "metrics.profile",
+    );
+    const pageRuntime = ValueChecks.optionalBoolean(
+      raw.pageRuntime,
+      DEFAULT_METRIC_PROFILE.pageRuntime,
+      "metrics.pageRuntime",
+    );
+    const trace = ValueChecks.optionalBoolean(
+      raw.trace,
+      DEFAULT_METRIC_PROFILE.trace,
+      "metrics.trace",
+    );
+    const normalizeLevel = (value, location, fallback) => {
+      const level = value === undefined ? fallback : ValueChecks.string(value, location);
+      if (!new Set(["required", "optional", "disabled"]).has(level)) {
+        throw new ConfigurationError(`${location} must be required, optional, or disabled.`);
+      }
+      return level;
+    };
+    return {
+      profile,
+      pageRuntime,
+      trace,
+      webgl: normalizeLevel(raw.webgl, "metrics.webgl", DEFAULT_METRIC_PROFILE.webgl),
+      systemGpu: normalizeLevel(raw.systemGpu, "metrics.systemGpu", DEFAULT_METRIC_PROFILE.systemGpu),
     };
   }
 
@@ -523,6 +575,13 @@ class ComparisonConfig {
         "retry.maxInputRetries",
         0,
         10,
+      ),
+      maxPreparationRetries: ValueChecks.optionalInteger(
+        raw.maxPreparationRetries,
+        DEFAULT_RETRY_POLICY.maxPreparationRetries,
+        "retry.maxPreparationRetries",
+        0,
+        3,
       ),
       durationBackoffMultiplier: ValueChecks.optionalNumber(
         raw.durationBackoffMultiplier,
@@ -804,6 +863,7 @@ class ComparisonConfig {
         "text",
         "postcondition",
         "whenExpression",
+        "settleMs",
       ],
       location,
     );
@@ -868,6 +928,15 @@ class ComparisonConfig {
       result.whenExpression = ValueChecks.string(
         raw.whenExpression,
         `${location}.whenExpression`,
+      );
+    }
+    if (raw.settleMs !== undefined) {
+      result.settleMs = ValueChecks.optionalInteger(
+        raw.settleMs,
+        0,
+        `${location}.settleMs`,
+        0,
+        60000,
       );
     }
     return result;
@@ -1532,16 +1601,30 @@ class SummaryStore {
   }
 
   static numeric(values) {
-    const finite = values.filter((value) => Number.isFinite(value));
+    const finite = values
+      .filter((value) => Number.isFinite(value))
+      .sort((left, right) => left - right);
     if (finite.length === 0) {
-      return { count: 0, mean: null, min: null, max: null, range: null };
+      return {
+        count: 0,
+        mean: null,
+        min: null,
+        p50: null,
+        p95: null,
+        max: null,
+        range: null,
+      };
     }
     const min = Math.min(...finite);
     const max = Math.max(...finite);
+    const percentile = (ratio) =>
+      finite[Math.min(finite.length - 1, Math.floor((finite.length - 1) * ratio))];
     return {
       count: finite.length,
       mean: finite.reduce((sum, value) => sum + value, 0) / finite.length,
       min,
+      p50: percentile(0.5),
+      p95: percentile(0.95),
       max,
       range: { min, max },
     };
@@ -1551,6 +1634,7 @@ class SummaryStore {
     const targetSamples = samples.filter((sample) => sample.targetIndex === targetIndex);
     const acceptedSamples = targetSamples.filter((sample) => sample.accepted === true);
     const metric = (name) => SummaryStore.numeric(acceptedSamples.map((sample) => sample.metrics[name]));
+    const pathMetric = (read) => SummaryStore.numeric(acceptedSamples.map(read));
     const gapCandidates = [];
     for (const sample of acceptedSamples) {
       for (const [metricName, value] of Object.entries({
@@ -1572,12 +1656,71 @@ class SummaryStore {
         inputAckCount: metric("inputAckCount"),
         inputReceivedCount: metric("inputReceivedCount"),
         coalescedEventCount: metric("coalescedEventCount"),
+        inputReceivedRatio: metric("inputReceivedRatio"),
+        negativeMagnitudeRatio: metric("negativeMagnitudeRatio"),
+        positiveMagnitudeRatio: metric("positiveMagnitudeRatio"),
+        inputAckLatencyMs: pathMetric((sample) => sample.input?.ack?.maximumLatencyMs),
+        inputDispatchErrorMs: pathMetric((sample) => sample.input?.dispatch?.maximumScheduleErrorMs),
+        inputReceivedScheduleErrorMs: pathMetric(
+          (sample) => sample.input?.delivery?.variance?.maximumReceivedScheduleErrorMilliseconds,
+        ),
         rafAverageFps: metric("rafAverageFps"),
+        rafP50FrameIntervalMs: pathMetric((sample) => sample.raf?.p50FrameIntervalMilliseconds),
+        rafP95FrameIntervalMs: pathMetric((sample) => sample.raf?.p95FrameIntervalMilliseconds),
         compositorAverageFps: metric("compositorAverageFps"),
+        compositorP50FrameIntervalMs: pathMetric((sample) => sample.compositor?.p50FrameIntervalMs),
+        compositorP95FrameIntervalMs: pathMetric((sample) => sample.compositor?.p95FrameIntervalMs),
         presentationAverageFps: metric("presentationAverageFps"),
+        presentationP50FrameIntervalMs: pathMetric(
+          (sample) => sample.presentation?.frameDisplayed?.p50FrameIntervalMs,
+        ),
+        presentationP95FrameIntervalMs: pathMetric(
+          (sample) => sample.presentation?.frameDisplayed?.p95FrameIntervalMs,
+        ),
+        presentationCoverage: pathMetric(
+          (sample) => sample.presentation?.frameDisplayed?.targetCorrelation?.presentationCoverage,
+        ),
+        presentationAlignmentP95Ms: pathMetric(
+          (sample) => sample.presentation?.frameDisplayed?.targetCorrelation?.presentationNearestOffsetP95Ms,
+        ),
         rafMaxFrameGapMs: metric("rafMaxFrameGapMs"),
         compositorMaxFrameGapMs: metric("compositorMaxFrameGapMs"),
         presentationMaxFrameGapMs: metric("presentationMaxFrameGapMs"),
+        rafLongFrameCount: pathMetric((sample) => sample.raf?.longFrameCount),
+        compositorLongFrameCount: pathMetric((sample) => sample.compositor?.longFrameCount),
+        presentationLongFrameCount: pathMetric(
+          (sample) => sample.presentation?.frameDisplayed?.longFrameCount,
+        ),
+        longTaskCount: pathMetric((sample) => sample.diagnostics?.longTaskCount),
+        longTaskDurationMs: pathMetric(
+          (sample) => sample.diagnostics?.longTaskDurationMilliseconds,
+        ),
+        longTaskDurationP95Ms: pathMetric(
+          (sample) => sample.diagnostics?.longTaskDurationP95Milliseconds,
+        ),
+        longTaskDurationMaxMs: pathMetric(
+          (sample) => sample.diagnostics?.longTaskDurationMaxMilliseconds,
+        ),
+        jsHeapUsedDeltaBytes: pathMetric(
+          (sample) => sample.pagePerformance?.delta?.heap?.usedSize,
+        ),
+        jsHeapTotalDeltaBytes: pathMetric(
+          (sample) => sample.pagePerformance?.delta?.heap?.totalSize,
+        ),
+        domNodesDelta: pathMetric((sample) => sample.pagePerformance?.delta?.domCounters?.nodes),
+        layoutCountDelta: pathMetric((sample) => sample.pagePerformance?.delta?.metrics?.LayoutCount),
+        recalcStyleCountDelta: pathMetric(
+          (sample) => sample.pagePerformance?.delta?.metrics?.RecalcStyleCount,
+        ),
+        scriptDurationDeltaSeconds: pathMetric(
+          (sample) => sample.pagePerformance?.delta?.metrics?.ScriptDuration,
+        ),
+        taskDurationDeltaSeconds: pathMetric(
+          (sample) => sample.pagePerformance?.delta?.metrics?.TaskDuration,
+        ),
+        resourceTransferDeltaBytes: pathMetric(
+          (sample) => sample.pagePerformance?.delta?.resources?.transferSize,
+        ),
       },
       worstMaxGap: gapCandidates[0] || { metric: null, value: null },
     };
@@ -1600,9 +1743,11 @@ class SummaryStore {
         retry: this.config.retry,
         environment: this.config.environment,
         execution: this.config.execution,
+        metrics: this.config.metrics,
         targets: this.config.targets,
         rules: {
           targetDiscovery: "Each round runs cdp.mjs status and list, then requires one exact URL match per target.",
+          targetLifecycle: "Fresh-state reloads rediscover both exact URLs and rebind replacement target IDs before readiness, setup, or sampling.",
           foregroundActivation:
             this.config.sample.inputBackend === "windows-native"
               ? "Native Windows wheel mode explicitly activates one exact target window immediately before its sample; the two targets are sampled sequentially because SendInput targets the foreground render widget."
@@ -1632,8 +1777,10 @@ class SummaryStore {
           anchor: "Each attempt saves paired canvas screenshots and rejects a camera/model anchor mismatch before wheel input.",
           ready: "Each target may provide setup.readyExpression so application-specific readiness can be proven instead of treating canvas existence as sufficient.",
           retry: this.config.execution.prepareOnly || this.config.execution.reuseReadyState
-            ? "Preparation-only and prepared-state modes do not retry because they intentionally emit one auditable gate result instead of changing the established browser state."
-            : "A hard trusted-input, direction/accumulation, timing, visual, or trace failure discards the entire pair, reloads both targets, re-runs setup and anchor gates, and retries only up to the configured limit with the recorded cadence backoff. Valid same-direction browser coalescing is accepted and recorded.",
+            ? this.config.execution.prepareOnly && this.config.retry.maxPreparationRetries > 0
+              ? "Preparation-only mode may retry the complete discovery, reload, setup, and anchor sequence up to maxPreparationRetries; prepared-state mode never mutates or retries the established state."
+              : "Preparation-only and prepared-state modes emit one auditable gate result unless an explicit preparation retry is configured."
+            : "A preparation contract failure may rerun complete discovery, reload, setup, and anchor gates up to maxPreparationRetries. A hard trusted-input mismatch discards the pair and retries up to maxInputRetries. Valid same-direction browser coalescing is accepted and recorded.",
           aggregation: this.config.execution.prepareOnly
             ? "Preparation-only mode emits no wheel samples and therefore no numeric performance aggregate."
             : "Only accepted paired samples contribute to aggregate numeric metrics; valid coalescing remains visible in input.coalescing and invalid attempts remain in samples for audit.",
@@ -1776,8 +1923,12 @@ class ComparisonRunner {
     const maximumInputAttempts = this.reuseReadyState || this.prepareOnly
       ? 1
       : this.config.retry.maxInputRetries + 1;
-    const maximumAttempts = maximumInputAttempts;
+    const maximumPreparationAttempts = this.reuseReadyState
+      ? 1
+      : this.config.retry.maxPreparationRetries + 1;
+    const maximumAttempts = maximumInputAttempts + maximumPreparationAttempts - 1;
     let inputAttemptNumber = 1;
+    let preparationAttemptNumber = 1;
     for (let attemptNumber = 1; attemptNumber <= maximumAttempts; attemptNumber += 1) {
       const timing = new AttemptTiming();
       const attemptSample = RoundAttemptPlan.sample(
@@ -1786,6 +1937,7 @@ class ComparisonRunner {
       const attempt = {
         attempt: attemptNumber,
         retryIndex: inputAttemptNumber - 1,
+        preparationRetryIndex: preparationAttemptNumber - 1,
         sample: attemptSample,
         targets: [],
         sampleIds: [],
@@ -1793,12 +1945,13 @@ class ComparisonRunner {
       };
       round.attempts.push(attempt);
       let overlaySessions = [];
+      let preparationComplete = false;
       try {
         const discovery = await timing.run(
           "targetDiscovery",
           () => this.discoverTargets(roundNumber, attemptNumber),
         );
-        const discovered = discovery.targets;
+        let discovered = discovery.targets;
         attempt.cdp = {
           status: discovery.status,
           targetList: discovery.targetList,
@@ -1850,16 +2003,23 @@ class ComparisonRunner {
           this.progress(
             `round ${roundNumber}/${this.config.sample.rounds} attempt ${attemptNumber}/${maximumAttempts}: reload and wait`,
           );
-          if (attemptSample.inputBackend === "windows-native") {
-            attempt.nativeWindowStatePreparation = await timing.run(
-              "nativeWindowStatePreparation",
-              () => this.restoreNativeWindowStates(discovered),
-            );
-          }
-          await timing.run(
-            "reloadAndReady",
-            () => this.reloadAndWait(discovered),
+          attempt.windowStatePreparation = await timing.run(
+            "windowStatePreparation",
+            () => this.restoreNormalWindowStates(discovered),
           );
+          const targetLifecycle = await timing.run(
+            "reloadAndReady",
+            () => this.reloadAndWait(discovered, roundNumber, attemptNumber),
+          );
+          discovered = targetLifecycle.targets;
+          attempt.targetLifecycle = targetLifecycle.evidence;
+          attempt.targets = discovered.map((entry, targetIndex) => ({
+            targetIndex,
+            name: this.config.targets[targetIndex].name,
+            id: entry.id,
+            title: entry.title,
+            url: entry.url,
+          }));
           if (this.config.environment.windowPlacement !== null) {
             attempt.windowPlacementApplication = await timing.run(
               "windowPlacementApplication",
@@ -1983,6 +2143,7 @@ class ComparisonRunner {
             anchorContract.reasons,
           );
         }
+        preparationComplete = true;
         if (this.prepareOnly) {
           attempt.preparationOnly = {
             valid: true,
@@ -2096,6 +2257,28 @@ class ComparisonRunner {
         }
         round.sampleIds = [...attempt.sampleIds];
         return;
+      } catch (error) {
+        attempt.error = {
+          name: error?.name || "Error",
+          message: error?.message || String(error),
+          details: Array.isArray(error?.details) ? error.details : [],
+        };
+        if (
+          !preparationComplete &&
+          preparationAttemptNumber < maximumPreparationAttempts
+        ) {
+          attempt.retry = {
+            requested: true,
+            reason: "preparation-contract-failure",
+            details: attempt.error.details,
+          };
+          preparationAttemptNumber += 1;
+          this.progress(
+            `round ${roundNumber}/${this.config.sample.rounds} attempt ${attemptNumber}: retrying full target discovery, reload, setup, and anchor gates after preparation failure`,
+          );
+          continue;
+        }
+        throw error;
       } finally {
         if (overlaySessions.length > 0) {
           attempt.fpsOverlayCleanup = await timing.run(
@@ -2180,7 +2363,7 @@ class ComparisonRunner {
     return result.value;
   }
 
-  async restoreNativeWindowStates(targets) {
+  async restoreNormalWindowStates(targets) {
     const restored = [];
     for (let targetIndex = 0; targetIndex < targets.length; targetIndex += 1) {
       const target = targets[targetIndex];
@@ -2188,7 +2371,7 @@ class ComparisonRunner {
         target.id,
         "Browser.getWindowForTarget",
         {},
-        `read native window state target ${targetIndex}`,
+        `read window state target ${targetIndex}`,
       );
       if (
         !Number.isInteger(browserWindow?.windowId) ||
@@ -2207,7 +2390,7 @@ class ComparisonRunner {
             windowId: browserWindow.windowId,
             bounds: { windowState: "normal" },
           },
-          `restore native window state target ${targetIndex}`,
+          `restore normal window state target ${targetIndex}`,
         );
         await Timer.sleep(this.config.environment.settleMs);
       }
@@ -2301,16 +2484,74 @@ class ComparisonRunner {
     };
   }
 
-  async reloadAndWait(targets) {
-    await Promise.all(
+  async reloadAndWait(targets, roundNumber, attemptNumber) {
+    const reloads = await Promise.all(
       targets.map(async (target, targetIndex) => {
-        await this.processes.run(
-          CDP_SCRIPT,
-          this.cdpArgs("reload", target.id),
-          { label: `reload target ${targetIndex}` },
-        );
-        await this.waitForReadySurface(target, targetIndex);
+        try {
+          const result = await this.processes.run(
+            CDP_SCRIPT,
+            this.cdpArgs("reload", target.id),
+            { label: `reload target ${targetIndex}` },
+          );
+          return {
+            targetIndex,
+            previousTargetId: target.id,
+            exitCode: result.exitCode,
+            error: null,
+          };
+        } catch (error) {
+          return {
+            targetIndex,
+            previousTargetId: target.id,
+            exitCode: null,
+            error: error?.message || String(error),
+          };
+        }
       }),
+    );
+    const rediscovery = await this.waitForTargetRediscovery(
+      roundNumber,
+      attemptNumber,
+    );
+    await Promise.all(
+      rediscovery.targets.map((target, targetIndex) =>
+        this.waitForReadySurface(target, targetIndex),
+      ),
+    );
+    return {
+      targets: rediscovery.targets,
+      evidence: {
+        mode: "reload-and-rebind-exact-targets",
+        reloads,
+        rediscovery: {
+          targetList: rediscovery.targetList,
+          targets: rediscovery.targets.map((target, targetIndex) => ({
+            targetIndex,
+            name: this.config.targets[targetIndex].name,
+            previousTargetId: targets[targetIndex].id,
+            reboundTargetId: target.id,
+            changed: target.id !== targets[targetIndex].id,
+            url: target.url,
+          })),
+        },
+      },
+    };
+  }
+
+  async waitForTargetRediscovery(roundNumber, attemptNumber) {
+    const deadline = Date.now() + Math.min(this.cdpTimeoutMs, 15000);
+    let lastError = null;
+    while (Date.now() < deadline) {
+      try {
+        return await this.discoverTargets(roundNumber, attemptNumber);
+      } catch (error) {
+        lastError = error;
+      }
+      await Timer.sleep(250);
+    }
+    throw new ContractError(
+      `Exact Chrome targets did not recover after reload in round ${roundNumber} attempt ${attemptNumber}: ${lastError?.message || "unknown target discovery failure"}.`,
+      Array.isArray(lastError?.details) ? lastError.details : [],
     );
   }
 
@@ -2453,6 +2694,10 @@ class ComparisonRunner {
             action.postcondition,
           );
         }
+        if ((action.settleMs ?? 0) > 0) {
+          await Timer.sleep(action.settleMs);
+        }
+        actionRecord.settleMs = action.settleMs ?? 0;
         actions.push(actionRecord);
       }
       await Timer.sleep(this.config.targets[targetIndex].setup.settleMs);
@@ -3254,6 +3499,14 @@ class ComparisonRunner {
           matches: capture.input?.dispatchAckCountMatches ?? false,
           maximumLatencyMs: capture.input?.maximumDispatchAckLatencyMilliseconds ?? null,
         },
+        dispatch: {
+          maximumScheduleErrorMs:
+            capture.input?.maximumDispatchErrorMilliseconds ?? null,
+          maximumAllowedScheduleErrorMs:
+            capture.input?.maximumAllowedDispatchErrorMilliseconds ?? null,
+          maximumInFlightObserved: capture.input?.maximumInFlightObserved ?? null,
+          maximumInFlightAllowed: capture.input?.maximumInFlightAllowed ?? null,
+        },
         received: {
           expected: capture.input?.count ?? null,
           count: inputReceivedCount,
@@ -3268,6 +3521,7 @@ class ComparisonRunner {
         delivery: inputDelivery,
       },
       visual: capture.visualChange || null,
+      pagePerformance: capture.pagePerformance || null,
       raf,
       compositor,
       presentation: {
@@ -3278,6 +3532,27 @@ class ComparisonRunner {
       traceIntegrity: {
         capture: traceEnabled ? capture.trace?.completeness || null : null,
         analyzed: traceEnabled ? analyzed?.traceIntegrity || null : null,
+      },
+      traceAnalysis: traceEnabled
+        ? {
+            traceEventCount: analyzed?.traceEventCount ?? null,
+            analysisEventCount: analyzed?.analysisEventCount ?? null,
+            eventCounts: analyzed?.eventCounts || null,
+            longTasks: analyzed?.longTasks || null,
+            traceCoverage: analyzed?.traceCoverage || null,
+            limitations: analyzed?.limitations || [],
+          }
+        : null,
+      diagnostics: {
+        longTaskCount: capture.diagnostics?.longTaskCount ?? null,
+        longTaskDurationMilliseconds:
+          capture.diagnostics?.longTaskDurationMilliseconds ?? null,
+        longTaskDurationP50Milliseconds:
+          capture.diagnostics?.longTaskDurationP50Milliseconds ?? null,
+        longTaskDurationP95Milliseconds:
+          capture.diagnostics?.longTaskDurationP95Milliseconds ?? null,
+        longTaskDurationMaxMilliseconds:
+          capture.diagnostics?.longTaskDurationMaxMilliseconds ?? null,
       },
       pageErrors: capture.diagnostics?.pageErrors || [],
       metrics,
@@ -3305,6 +3580,7 @@ class SelfTest {
       ],
     });
     assert.deepEqual(config.sample, DEFAULT_SAMPLE);
+    assert.deepEqual(config.metrics, DEFAULT_METRIC_PROFILE);
     const configuredPoint = ComparisonConfig.fromObject({
       schemaVersion: 1,
       sample: { canvasPoint: { xRatio: 0.25, yRatio: 0.75 } },

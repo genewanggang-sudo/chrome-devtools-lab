@@ -62,7 +62,9 @@ names, or application loaders. Keep those details in the calling project's
 scenario file. The runner validates the JSON before touching Chrome and writes
 the resolved config into every run contract.
 
-The runner re-discovers exact targets for every round, reloads both pages,
+The runner re-discovers exact targets for every round and again after reload,
+then rebinds any replacement target IDs before continuing. It restores minimized or
+maximized target windows to a normal state before reload, reloads both pages,
 waits for the configured setup condition, normalizes existing Chrome window
 bounds through verified Win32 placement when needed, checks
 canvas/DPR/drawing-buffer parity, and alternates sample order across rounds.
@@ -75,9 +77,17 @@ on failure.
 The runner does not call `Page.bringToFront`. Every run receives a unique
 output directory and existing evidence is not overwritten.
 
+Scenario configs may declare a generic `metrics` profile. The plugin validates
+and records that profile in the run contract; application-specific metric
+ownership remains with the calling project.
+
 Use `--prepare-only` with any scenario for a fresh reload/setup/alignment gate
-that sends no wheel input and starts no FPS or trace instrumentation. Use
-`--rounds` and `--max-input-retries` to override the corresponding JSON values.
+that sends no wheel input and starts no FPS or trace instrumentation. A scenario
+may set `retry.maxPreparationRetries` to repeat the complete target discovery,
+reload, setup, and anchor sequence after a preparation contract failure. Setup
+actions may set `settleMs` when a camera or fit command has an application-owned
+animation that must finish before the next action. Use `--rounds` and
+`--max-input-retries` to override the corresponding JSON values.
 
 When two visible windows have already been refreshed and aligned, use
 `--reuse-ready-state` only with a scenario whose setup action arrays are empty:
@@ -99,13 +109,22 @@ prepared-state sample.
 
 ## Evidence Layers
 
-- `scripts/wheel-benchmark.mjs` supports trusted CDP wheel input and verified Windows `SendInput` wheel input. Configured comparisons record input delivery, visual change, rAF diagnostics, Chrome trace data, and DevTools FPS overlay state.
+- `scripts/wheel-benchmark.mjs` supports trusted CDP wheel input and verified Windows `SendInput` wheel input. Configured comparisons record input delivery, visual change, rAF diagnostics, page runtime/heap/DOM/resource before-after deltas, Chrome trace data, and DevTools FPS overlay state.
 - `scripts/analyze-trace.mjs` reports validated `Display::FrameDisplayed` cadence and Chrome compositor `STEP_DRAW_AND_SWAP` cadence. The former is the strongest browser trace presentation signal available here; it is not a DWM monitor Present measurement.
 - rAF and screencast rates are diagnostics. They must not be reported as GPU FPS.
 - The DevTools FPS overlay is visible only while the target has a visible display surface. CDP can enable it but does not return the overlay's numeric value.
 - `scripts/present-fps.mjs` is an optional Windows PresentMon backend for system Present/DWM attribution. It may require the Performance Log Users group or administrator rights and downloads the executable to a user-local cache.
 
 Keep CPU profiles, heap sampling, trace captures, and WebGL/draw-call instrumentation as separate captures. Do not combine profiler overhead with a final KPI sample.
+
+The wheel capture exposes the following metric layers without asserting that all
+of them are final GPU KPIs: input ACK and DOM delivery distributions, page
+`Performance.getMetrics` deltas, JS heap and DOM counter deltas, resource
+timing totals, rAF cadence, compositor draw/swap cadence, target-correlated
+`Display::FrameDisplayed` cadence, long tasks, trace integrity, and GPU/
+compositor event counts. Application-specific draw calls, geometry counts,
+shader switches, and GPU memory remain optional instrumentation supplied by the
+calling project or a graphics tool.
 
 ## Direct CDP Commands
 

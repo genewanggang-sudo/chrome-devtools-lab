@@ -447,6 +447,147 @@ async function evaluate(session, expression) {
   return response.result?.value;
 }
 
+const PAGE_PERFORMANCE_METRIC_NAMES = Object.freeze([
+  "Timestamp",
+  "Documents",
+  "Frames",
+  "JSEventListeners",
+  "Nodes",
+  "LayoutObjects",
+  "LayoutCount",
+  "RecalcStyleCount",
+  "LayoutDuration",
+  "RecalcStyleDuration",
+  "DevToolsCommandDuration",
+  "ScriptDuration",
+  "TaskDuration",
+  "ThreadTime",
+  "ProcessTime",
+  "JSHeapUsedSize",
+  "JSHeapTotalSize",
+]);
+
+async function readPagePerformanceSnapshot(session, phase) {
+  const snapshot = {
+    schemaVersion: 1,
+    phase,
+    capturedAtEpochMs: Date.now(),
+    pageNowMs: null,
+    metrics: {},
+    heap: null,
+    domCounters: null,
+    resources: null,
+    errors: [],
+  };
+  try {
+    await session.send("Performance.enable");
+    const response = await session.send("Performance.getMetrics");
+    for (const metric of response.metrics || []) {
+      if (PAGE_PERFORMANCE_METRIC_NAMES.includes(metric.name)) {
+        snapshot.metrics[metric.name] = metric.value;
+      }
+    }
+  } catch (error) {
+    snapshot.errors.push(`Performance.getMetrics: ${error.message}`);
+  }
+  try {
+    const response = await session.send("Runtime.getHeapUsage");
+    snapshot.heap = {
+      usedSize: response.usedSize ?? null,
+      totalSize: response.totalSize ?? null,
+      embedderHeapUsedSize: response.embedderHeapUsedSize ?? null,
+      mallocedSize: response.mallocedSize ?? null,
+    };
+  } catch (error) {
+    snapshot.errors.push(`Runtime.getHeapUsage: ${error.message}`);
+  }
+  try {
+    const response = await session.send("Memory.getDOMCounters");
+    snapshot.domCounters = {
+      documents: response.documents ?? null,
+      nodes: response.nodes ?? null,
+      jsEventListeners: response.jsEventListeners ?? null,
+    };
+  } catch (error) {
+    snapshot.errors.push(`Memory.getDOMCounters: ${error.message}`);
+  }
+  try {
+    snapshot.resources = await evaluate(
+      session,
+      `(() => {
+        const entries = performance.getEntriesByType("resource");
+        const durations = entries
+          .map((entry) => entry.duration)
+          .filter(Number.isFinite)
+          .sort((a, b) => a - b);
+        const percentile = (values, ratio) =>
+          values.length === 0
+            ? null
+            : values[Math.min(values.length - 1, Math.floor((values.length - 1) * ratio))];
+        return {
+          count: entries.length,
+          transferSize: entries.reduce(
+            (sum, entry) => sum + (Number.isFinite(entry.transferSize) ? entry.transferSize : 0),
+            0,
+          ),
+          encodedBodySize: entries.reduce(
+            (sum, entry) => sum + (Number.isFinite(entry.encodedBodySize) ? entry.encodedBodySize : 0),
+            0,
+          ),
+          decodedBodySize: entries.reduce(
+            (sum, entry) => sum + (Number.isFinite(entry.decodedBodySize) ? entry.decodedBodySize : 0),
+            0,
+          ),
+          durationP50Ms: percentile(durations, 0.5),
+          durationP95Ms: percentile(durations, 0.95),
+          durationMaxMs: durations.length === 0 ? null : durations[durations.length - 1],
+          pageNowMs: performance.now(),
+        };
+      })()`,
+    );
+    snapshot.pageNowMs = snapshot.resources?.pageNowMs ?? null;
+  } catch (error) {
+    snapshot.errors.push(`Resource Timing: ${error.message}`);
+  }
+  return snapshot;
+}
+
+function subtractNumericRecord(before, after) {
+  const result = {};
+  for (const key of new Set([
+    ...Object.keys(before || {}),
+    ...Object.keys(after || {}),
+  ])) {
+    const left = before?.[key];
+    const right = after?.[key];
+    result[key] = Number.isFinite(left) && Number.isFinite(right) ? right - left : null;
+  }
+  return result;
+}
+
+function diffPagePerformance(before, after) {
+  return {
+    schemaVersion: 1,
+    window: {
+      durationMs:
+        Number.isFinite(before?.pageNowMs) && Number.isFinite(after?.pageNowMs)
+          ? after.pageNowMs - before.pageNowMs
+          : null,
+      startedAtEpochMs: before?.capturedAtEpochMs ?? null,
+      endedAtEpochMs: after?.capturedAtEpochMs ?? null,
+    },
+    before,
+    after,
+    delta: {
+      metrics: subtractNumericRecord(before?.metrics, after?.metrics),
+      heap: subtractNumericRecord(before?.heap, after?.heap),
+      domCounters: subtractNumericRecord(before?.domCounters, after?.domCounters),
+      resources: subtractNumericRecord(before?.resources, after?.resources),
+    },
+    errors: [...(before?.errors || []), ...(after?.errors || [])],
+  };
+}
+
 async function setNativeFpsCounter(session, show) {
   if (show) {
     // Overlay.enable is session-scoped, so keep it in the same CDP session as
@@ -1824,6 +1965,10 @@ function summarizeProbe(
     intervals.length > 0
       ? intervals.reduce((sum, value) => sum + value, 0) / intervals.length
       : null;
+  const longTaskDurations = snapshot.longTasks
+    .map((entry) => entry.duration)
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right);
   return {
     expectedEventCount: expectedEvents.length,
     receivedEventCount: events.length,
@@ -1872,6 +2017,7 @@ function summarizeProbe(
       label: "requestAnimationFrame cadence diagnostic only",
       frameCount: intervals.length,
       averageFps: frameMean === null ? null : 1000 / frameMean,
+      p50FrameIntervalMilliseconds: percentile(intervals, 0.5),
       p95FrameIntervalMilliseconds: percentile(intervals, 0.95),
       maximumFrameIntervalMilliseconds:
         intervals.length > 0 ? Math.max(...intervals) : null,
@@ -1882,6 +2028,10 @@ function summarizeProbe(
       (sum, entry) => sum + entry.duration,
       0,
     ),
+    longTaskDurationP50Milliseconds: percentile(longTaskDurations, 0.5),
+    longTaskDurationP95Milliseconds: percentile(longTaskDurations, 0.95),
+    longTaskDurationMaxMilliseconds:
+      longTaskDurations.length > 0 ? longTaskDurations.at(-1) : null,
     pageErrors: snapshot.pageErrors,
     inputObservation: snapshot.inputObservation || null,
     postInputFrames: postFrames,
@@ -2113,6 +2263,10 @@ async function main(options) {
       traceComplete = traceSession.waitForEvent("Tracing.tracingComplete");
     }
     const probeMeasurementReset = await resetProbeForMeasurement(session);
+    const pagePerformanceBefore = await readPagePerformanceSnapshot(
+      session,
+      "before-input",
+    );
     const dispatchStartEpochMs = Date.now();
     const midpointHashPromise = skipMidpointScreenshot
       ? Promise.resolve({ hash: null, error: null })
@@ -2180,6 +2334,14 @@ async function main(options) {
       session,
       expectedEvents.length,
       WHEEL_DELIVERY_WAIT_MAX_MS,
+    );
+    const pagePerformanceAfter = await readPagePerformanceSnapshot(
+      session,
+      "after-input",
+    );
+    const pagePerformance = diffPagePerformance(
+      pagePerformanceBefore,
+      pagePerformanceAfter,
     );
     const afterHash = await captureCanvasHash(session, canvas);
     await cleanupProbe();
@@ -2538,6 +2700,7 @@ async function main(options) {
         legacyMousewheelBridge,
       },
       visualChange,
+      pagePerformance,
       diagnostics,
       fpsCounter,
       trace: {
