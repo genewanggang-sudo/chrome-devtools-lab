@@ -1,0 +1,23 @@
+{
+  "name": "chrome-devtools-lab",
+  "description": "Chrome browser control and performance evidence toolkit for Codex and ZCode.",
+  "owner": {
+    "name": "Gene Wang",
+    "url": "https://github.com/genewanggang-sudo"
+  },
+  "plugins": [
+    {
+      "name": "chrome-devtools-lab",
+      "description": "A maintainable Chrome browser testing, debugging, control, and performance-analysis toolkit.",
+      "author": {
+        "name": "Gene Wang"
+      },
+      "category": "developer-tools",
+      "source": {
+        "source": "git",
+        "url": "https://github.com/genewanggang-sudo/chrome-devtools-lab.git",
+        "ref": "main"
+      }
+    }
+  ]
+}

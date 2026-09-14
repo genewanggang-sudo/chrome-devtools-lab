@@ -5,6 +5,15 @@ description: Control a dedicated Chrome instance directly through CDP with exact
 
 # Direct CDP
 
+## Locating the bundled scripts
+
+The bundled scripts live in `scripts/` at the plugin root. Resolve them
+relative to this SKILL.md file: `<this-skill-directory>/../../scripts/`.
+Both Codex and ZCode install the plugin with `skills/` and `scripts/`
+co-located, so the relative path is host-independent. In the examples
+below, `<plugin-root>` stands for the resolved plugin root directory (the
+parent of `skills/`).
+
 Use the bundled `scripts/cdp.mjs`. Do not use `@chrome`,
 `agent.browsers.get("extension")`, or another browser bridge for the same
 target. The default endpoint is `http://127.0.0.1:9333`.
@@ -16,7 +25,7 @@ Create disposable pages with `new` and close only the exact IDs returned by
 that command. Do not guess from a title or URL when more than one page matches.
 
 ```powershell
-$directCdp = "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\cdp.mjs"
+$directCdp = "<plugin-root>\scripts\cdp.mjs"
 node $directCdp status
 node $directCdp list
 node $directCdp new --url "about:blank" --new-window --focus false
@@ -81,9 +90,9 @@ window, the two targets are sampled sequentially.
 For a saved trace, use:
 
 ```powershell
-node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\capture-trace.mjs" `
+node "<plugin-root>\scripts\capture-trace.mjs" `
   --target-exact "TARGET_ID" --duration 5000 --output "$env:TEMP\trace.json"
-node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\analyze-trace.mjs" `
+node "<plugin-root>\scripts\analyze-trace.mjs" `
   --input "$env:TEMP\trace.json" --output "$env:TEMP\trace-summary.json"
 ```
 

@@ -5,6 +5,15 @@ description: Profile and compare Chrome rendering, WebGL, scrolling, zoom, input
 
 # Chrome Performance Lab
 
+## Locating the bundled scripts
+
+The bundled scripts live in `scripts/` at the plugin root. Resolve them
+relative to this SKILL.md file: `<this-skill-directory>/../../scripts/`.
+Both Codex and ZCode install the plugin with `skills/` and `scripts/`
+co-located, so the relative path is host-independent. In the examples
+below, `<plugin-root>` stands for the resolved plugin root directory (the
+parent of `skills/`).
+
 Use this skill for performance diagnosis. Do not reduce the task to a single
 page timer or a single FPS sample.
 
@@ -100,7 +109,7 @@ samples that violate any part of the contract instead of averaging them in.
 3. Capture a trace on a disposable or controlled target:
 
    ```powershell
-   node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\capture-trace.mjs" `
+   node "<plugin-root>\scripts\capture-trace.mjs" `
      --target-exact "TARGET_ID" --duration 5000 `
      --output "$env:TEMP\chrome-trace.json"
    ```
@@ -109,7 +118,7 @@ samples that violate any part of the contract instead of averaging them in.
    plugin's combined sampler. It does not report GPU FPS by itself:
 
    ```powershell
-  node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\wheel-benchmark.mjs" `
+  node "<plugin-root>\scripts\wheel-benchmark.mjs" `
     --target-exact "TARGET_ID" --x 768 --y 504 --count 120 `
     --duration 2000 --delta-y 40 `
     --input-backend windows-native --legacy-mousewheel-bridge `
@@ -143,7 +152,7 @@ samples that violate any part of the contract instead of averaging them in.
 4. Analyze it:
 
    ```powershell
-  node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\analyze-trace.mjs" `
+  node "<plugin-root>\scripts\analyze-trace.mjs" `
     --input "$env:TEMP\wheel-sample.trace.json" `
     --capture-result "$env:TEMP\wheel-sample.json" `
     --output "$env:TEMP\chrome-trace-summary.json"
@@ -154,7 +163,7 @@ samples that violate any part of the contract instead of averaging them in.
    independent Windows ETW/DWM cross-check around the same wheel operation:
 
    ```powershell
-   node "$env:USERPROFILE\plugins\chrome-devtools-lab\scripts\present-fps.mjs" wheel `
+   node "<plugin-root>\scripts\present-fps.mjs" wheel `
      --target-exact "TARGET_ID" --x 768 --y 504 --count 120 `
      --duration 2000 --delta-y 40 --expected-dpr 1 `
      --expected-viewport-width 1192 --expected-viewport-height 1028 `

@@ -45,6 +45,26 @@ The repository contains no machine-specific credentials, browser profiles, or
 local source paths. A normal `git clone` is useful for development, but by
 itself it does not install the plugin into Codex.
 
+## Install Into ZCode
+
+The same repository is a dual-host plugin. ZCode reads
+`.zcode-plugin/plugin.json` (Codex reads `.codex-plugin/plugin.json`); the
+`skills/` and `scripts/` trees are shared and are the single maintenance
+point. In ZCode, open **Settings → Plugin Management → Discover**, click
+**+**, and add this GitHub repository (or a local clone directory) as a
+marketplace, then install `chrome-devtools-lab`.
+
+Skill instructions locate the bundled scripts relative to the SKILL.md file
+(`<this-skill-directory>/../../scripts/`), so no host-specific install path
+is referenced.
+
+### Manifest sync note
+
+`.zcode-plugin/plugin.json` inlines the MCP server definition because ZCode
+manifests use inline `mcpServers`. When the MCP configuration changes, update
+`.mcp.json` and the inline `mcpServers` block together, and bump `version` in
+both manifests so each host sees the upgrade.
+
 ## Configured Wheel Comparison
 
 `compare-wheel.mjs` is application-neutral. Create a scenario JSON outside the
