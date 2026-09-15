@@ -25,8 +25,9 @@ Keep these layers separate:
 | ---------------- | ------------------------------------------ | ---------------------------------------------------------------- |
 | Input            | direct CDP `wheel-probe`, `pointer`        | exact target, native CDP event, trusted delivery                 |
 | Page diagnostics | MCP console/network/snapshot plus page runtime snapshot | page state, errors, requests, DOM/UI state, heap/DOM/resource/runtime deltas |
-| CPU              | MCP performance tools or a V8 profile      | JavaScript and renderer CPU attribution                          |
-| Trace            | `capture-trace.mjs` + `analyze-trace.mjs`  | compositor work and target-correlated browser display cadence    |
+| CPU              | `capture-cpu-profile.mjs` + `analyze-cpu-profile.mjs` (V8 profile) | function-level self/total time, hot source locations, flame graph |
+| Line frequency   | `capture-cpu-profile.mjs --coverage`       | statement-level execution counts per line (not time)             |
+| Trace            | `capture-trace.mjs` + `analyze-trace.mjs`  | compositor work, long tasks, target-correlated browser display cadence |
 | System GPU       | WPR/GPUView                                | queue, GPU scheduling, Present/DWM attribution                   |
 | WebGL work       | app instrumentation or a graphics debugger | draw calls, passes, state changes, GPU workload                  |
 
@@ -178,15 +179,43 @@ samples that violate any part of the contract instead of averaging them in.
 
 5. Inspect input delivery, page runtime deltas, top long tasks,
    compositor/GPU event counts, frame interval distributions, trace integrity,
-   and missing evidence. Only then choose a code path to inspect.
-6. Run CPU, draw-call, and system GPU captures as separate follow-up samples.
+   and missing evidence. Long-task entries in the trace summary carry
+   `args.data` with `functionName`, `url`, and `lineNumber` (DevTools 0-based
+   convention) identifying the code that owned the task. Only then choose a
+   code path to inspect.
+6. Attribute the time inside long tasks with a separate CPU sample:
+   `capture-cpu-profile.mjs` (optionally `--reload`, and `--coverage` for
+   statement-level execution counts) plus `analyze-cpu-profile.mjs` for
+   per-function self/total time, hot source locations, and flame graph output.
+   Sampling time is function-level; coverage counts are line-level but are
+   frequencies, not time, and inflate timings.
 7. Preserve raw trace, summary, contract, invalid reasons, and exact commands
    as evidence. Never overwrite an earlier sample with a rerun.
 
+## Reporting contract
+
+The plugin collects evidence; the calling agent turns it into the
+deliverable. The final answer to the user is an analysis, never raw data:
+
+- Lead with the conclusion in the user's language, then the measured numbers
+  that support it: long tasks with their owning `functionName`/`url`/`line`,
+  hot functions by self time, hot lines by execution count when coverage was
+  captured.
+- Render the evidence the user cannot read directly: open generated flame
+  graph or report HTML in the controlled Chrome, screenshot it, read the
+  screenshot, and include the image path in the answer. Do not tell the user
+  to open a JSON file to understand the result.
+- Keep raw artifacts (trace, cpuprofile, summaries, screenshots) on disk and
+  list their paths as supporting evidence, labeled as such.
+- Raw JSON is input to the agent's analysis, not the report. If a capture was
+  invalid, say why instead of presenting numbers from it.
+
 ## Attribution rules
 
-- Long renderer tasks point to CPU/main-thread pressure; use the call stack or
-  CPU profile to find the owning code.
+- Long renderer tasks point to CPU/main-thread pressure; use the long task's
+  `args.data` stack, the V8 CPU profile, or coverage counts to find the owning
+  code. Sampling profiles give per-function time; coverage gives per-line
+  execution counts.
 - Compositor or renderer frame gaps without long JavaScript tasks require a
   trace/GPU queue check, not a speculative TypeScript optimization.
 - High draw calls identify workload volume, not the cause or the achievable

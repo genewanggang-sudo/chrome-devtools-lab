@@ -102,5 +102,30 @@ KPI. This is not the same as an independent DWM/monitor measurement. Keep CPU
 profiling, draw-call instrumentation, and WPR/GPUView captures separate from
 the frame-rate sample.
 
+For a CPU sample with function- and line-level attribution, use:
+
+```powershell
+node "<plugin-root>\scripts\capture-cpu-profile.mjs" `
+  --target-exact "TARGET_ID" --duration 3000 --reload `
+  --output "$env:TEMP\profile.cpuprofile"
+node "<plugin-root>\scripts\analyze-cpu-profile.mjs" `
+  --input "$env:TEMP\profile.cpuprofile" `
+  --output "$env:TEMP\profile-summary.json" `
+  --flamegraph "$env:TEMP\flame.html" `
+  --speedscope "$env:TEMP\profile.speedscope.json"
+```
+
+`capture-cpu-profile.mjs` records a V8 sampling profile on the exact target
+(`--reload` starts sampling before a page reload so load-time work is
+included). `analyze-cpu-profile.mjs` reports top functions by self and total
+time, top source locations, and per-URL totals; `--flamegraph` writes a
+self-contained HTML flame chart and `--speedscope` writes a file for
+speedscope.app. Sampling attributes time to functions: the reported line is
+the function's definition line, not the executing statement. For
+statement-level execution counts, add `--coverage --coverage-output
+<coverage.json>` to the capture; coverage instrumentation inflates measured
+times, so never use a coverage run as a timing KPI. Keep CPU captures
+separate from `capture-trace.mjs` frame-rate samples.
+
 See `references/direct-cdp-contract.md` for lifecycle, background, cleanup,
 and invalid-sample rules.
