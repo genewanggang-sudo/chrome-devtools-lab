@@ -7,13 +7,14 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { acquireTraceLock } from "./trace-lock.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9333;
 const DEFAULT_DURATION_MS = 3000;
 const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_SAMPLING_INTERVAL_US = 100;
+export const DEFAULT_SAMPLING_INTERVAL_US = 1000;
 
 function parseArgs(argv) {
   const options = {};
@@ -197,7 +198,12 @@ function lineOf(starts, offset) {
   return low + 1;
 }
 
-async function summarizeCoverage(session, scripts, limit, scriptInfoById) {
+export async function summarizeCoverage(
+  session,
+  scripts,
+  limit,
+  scriptInfoById,
+) {
   const summarized = [];
   for (const script of scripts) {
     let source = "";
@@ -222,10 +228,13 @@ async function summarizeCoverage(session, scripts, limit, scriptInfoById) {
       const callCount =
         typeof fn.callCount === "number"
           ? fn.callCount
-          : definitionRange?.count ?? 0;
+          : (definitionRange?.count ?? 0);
       functions.push({
         functionName: label,
         callCount,
+        scriptLine: definitionRange
+          ? lineOf(starts, definitionRange.startOffset)
+          : null,
         line: definitionRange
           ? startLine + lineOf(starts, definitionRange.startOffset)
           : null,
@@ -257,13 +266,15 @@ async function summarizeCoverage(session, scripts, limit, scriptInfoById) {
       functions: functions
         .map((fn) => ({
           ...fn,
-          documentLine: fn.line === null ? null : startLine + fn.line,
+          documentLine: fn.line,
         }))
         .sort((left, right) => right.callCount - left.callCount)
         .slice(0, limit),
       hotLinesByCount: [...lineMax.entries()]
         .map(([scriptLine, value]) => ({
           line: startLine + scriptLine,
+          scriptLine,
+          documentLine: startLine + scriptLine,
           count: value.count,
           functionName: value.functionName,
         }))
@@ -300,16 +311,19 @@ async function main() {
   const reload = options.reload === true;
   const coverage = options.coverage === true;
   const coverageOutput = options["coverage-output"];
-  if (coverage && (typeof coverageOutput !== "string" || coverageOutput.length === 0)) {
-    throw new Error(
-      "--coverage requires --coverage-output <coverage.json>.",
-    );
+  if (
+    coverage &&
+    (typeof coverageOutput !== "string" || coverageOutput.length === 0)
+  ) {
+    throw new Error("--coverage requires --coverage-output <coverage.json>.");
   }
   const coverageLimit = integerOption(options, "coverage-limit", 25, 1, 500);
   let coverageState = null;
   const output = options.output;
   if (typeof output !== "string" || output.length === 0) {
-    throw new Error("CPU profile capture requires --output <profile.cpuprofile>.");
+    throw new Error(
+      "CPU profile capture requires --output <profile.cpuprofile>.",
+    );
   }
   const { target, host, port } = await selectTarget(options);
   const session = await connect(target.webSocketDebuggerUrl, timeoutMs);
@@ -374,7 +388,8 @@ async function main() {
     }
     await lock.release();
     lock = null;
-    const profiledUs = Number(profile.endTime || 0) - Number(profile.startTime || 0);
+    const profiledUs =
+      Number(profile.endTime || 0) - Number(profile.startTime || 0);
     const cpuprofile = {
       nodes: profile.nodes,
       samples: profile.samples || [],
@@ -383,7 +398,11 @@ async function main() {
       endTime: profile.endTime,
     };
     await fs.mkdir(path.dirname(path.resolve(output)), { recursive: true });
-    await fs.writeFile(path.resolve(output), `${JSON.stringify(cpuprofile)}\n`, "utf8");
+    await fs.writeFile(
+      path.resolve(output),
+      `${JSON.stringify(cpuprofile)}\n`,
+      "utf8",
+    );
     let coverageFile = null;
     if (coverage) {
       await fs.mkdir(path.dirname(path.resolve(coverageOutput)), {
@@ -394,7 +413,7 @@ async function main() {
         `${JSON.stringify(
           {
             ok: true,
-            note: "Block coverage counts are execution frequencies, not time. Coverage instrumentation inflates measured wall times; use sampling-only captures for timing KPIs. Lines are 1-based and document-relative (inline scripts are mapped back to document lines via Debugger.scriptParsed.startLine). 'count' for a line is the execution count of the most-executed instrumented block containing that line.",
+            note: "Precise coverage reports instrumented range counts, not elapsed time or exact statement/line execution frequencies. Enclosing function and nested block ranges may overlap; each displayed line count is the maximum positive count among ranges overlapping that line. This can include unexecuted nested code inside an executed outer range. Coverage instrumentation affects measured wall times; use sampling-only captures for timing comparisons. line/documentLine are 1-based script positions translated to document coordinates exactly once via Debugger.scriptParsed.startLine; scriptLine is relative to the script. Positions refer to captured JavaScript, not automatically source-mapped source files.",
             target: { id: target.id, url: target.url },
             reload,
             scripts: coverageScripts,
@@ -449,7 +468,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error.message || error}\n`);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error.message || error}\n`);
+    process.exitCode = 1;
+  });
+}

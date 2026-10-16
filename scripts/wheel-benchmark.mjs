@@ -10,8 +10,11 @@ import { performance } from "node:perf_hooks";
 import {
   analyzeCompositorFps,
   findTraceWindow,
+  buildTargetFrameBinding,
+  readTargetFrameTree,
 } from "./frame-rate.mjs";
 import { analyzeTrace } from "./analyze-trace.mjs";
+import { parseTraceJson } from "./trace-json.mjs";
 import { acquireTraceLock } from "./trace-lock.mjs";
 import { runPowerShellNativeWheel } from "./windows-native-wheel.mjs";
 import { buildHumanWheelSequence } from "./wheel-sequence.mjs";
@@ -402,7 +405,7 @@ function connect(webSocketUrl, timeoutMs) {
     });
 
     socket.addEventListener("message", (event) => {
-      const message = JSON.parse(String(event.data));
+      const message = parseTraceJson(String(event.data));
       if (message.id != null) {
         const request = pending.get(message.id);
         if (!request) return;
@@ -2246,6 +2249,7 @@ async function main(options) {
     }
     await sleep(POINTER_SETTLE_MS);
     const beforeHash = await captureCanvasHash(session, canvas);
+    const frameTreeBefore = await readTargetFrameTree(session);
     if (traceSession !== null) {
       traceLock = await acquireTraceLock({
         host,
@@ -2368,7 +2372,7 @@ async function main(options) {
         : JSON.stringify({ traceEvents: collectedEvents });
       await traceLock.release();
       traceLock = null;
-      const parsedTrace = JSON.parse(traceText);
+      const parsedTrace = parseTraceJson(traceText);
       trace = Array.isArray(parsedTrace)
         ? { traceEvents: parsedTrace }
         : parsedTrace;
@@ -2377,10 +2381,16 @@ async function main(options) {
       });
       await fs.writeFile(
         path.resolve(traceOutput),
-        `${JSON.stringify(trace)}\n`,
+        Array.isArray(parsedTrace) ? `{"traceEvents":${traceText}}\n` : traceText,
         "utf8",
       );
     }
+    const frameTreeAfter = await readTargetFrameTree(session);
+    const targetFrameBinding = buildTargetFrameBinding(
+      target.id,
+      frameTreeBefore,
+      frameTreeAfter,
+    );
     const snapshot = disposed.snapshot;
     const pageAfter = await evaluate(
       session,
@@ -2450,11 +2460,13 @@ async function main(options) {
           startLabel: TRACE_WHEEL_START_MARKER,
           endLabel: TRACE_WHEEL_END_MARKER,
           targetId: target.id,
+          frameBinding: targetFrameBinding,
         })
       : null;
     const compositorFrameRate = traceEnabled
       ? analyzeCompositorFps(traceEvents, {
           targetId: target.id,
+          frameBinding: targetFrameBinding,
           window: frameRateWindow,
         })
       : null;
@@ -2464,6 +2476,8 @@ async function main(options) {
       fpsCounter.heldForMilliseconds = fpsCounterHoldMs;
     }
     const invalidReasons = [];
+    for (const reason of targetFrameBinding.invalidReasons)
+      addInvalidReason(invalidReasons, "target-frame-binding-invalid", reason);
     const nativeWheelObservation =
       diagnostics.inputObservation?.channels?.nativeWheel || null;
     if (nativeWheelObservation === null) {
@@ -2644,7 +2658,13 @@ async function main(options) {
       invalidReasons: captureValidity.invalidReasons,
       strictValid: captureValidity.strictValid,
       strictInvalidReasons: captureValidity.strictInvalidReasons,
-      target: { id: target.id, title: target.title, url: target.url },
+      target: {
+        id: target.id,
+        rootFrameId: targetFrameBinding.rootFrameId,
+        title: target.title,
+        url: target.url,
+      },
+      targetFrameBinding,
       page,
       pageAfter,
       preflight,

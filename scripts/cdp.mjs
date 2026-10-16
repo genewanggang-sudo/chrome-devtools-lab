@@ -6,6 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
+import { InputSequence } from "./input-sequence.mjs";
 
 const DEFAULT_PORT = 9333;
 const DEFAULT_HOST = "127.0.0.1";
@@ -14,8 +15,9 @@ const MIN_COMMAND_TIMEOUT_MS = 100;
 const MAX_COMMAND_TIMEOUT_MS = 600000;
 const FOCUS_VISIBILITY_WAIT_MS = 5000;
 const FOCUS_EMULATION_VISIBILITY_WAIT_MS = 4000;
-const RAF_PROBE_SETTLE_MS = 350;
-const RAF_PROBE_MIN_FRAMES = 2;
+const RAF_PROBE_WINDOW_MS = 500;
+const RAF_PROBE_MIN_FRAMES = 10;
+const RAF_PROBE_MAX_GAP_MS = 150;
 const WINDOW_BOUNDS_TOLERANCE_PX = 8;
 const WINDOW_RESOLUTION_RETRY_COUNT = 10;
 const WINDOW_RESOLUTION_RETRY_DELAY_MS = 75;
@@ -1139,40 +1141,55 @@ async function waitForVisiblePage(webSocketUrl, timeoutMs, maxWaitMs) {
   return page;
 }
 
-async function probeAnimationFrames(webSocketUrl, timeoutMs) {
-  const result = await evaluate(
-    webSocketUrl,
-    `(() => new Promise((resolve) => {
+function animationCadenceProbeExpression() {
+  return `(() => new Promise((resolve) => {
         const startedAt = performance.now();
-        let frames = 0;
+        const callbackOffsetsMs = [];
         let settled = false;
+        let frameHandle = 0;
         const finish = () => {
             if (settled) return;
             settled = true;
+            cancelAnimationFrame(frameHandle);
+            const elapsedMs = performance.now() - startedAt;
+            const boundaries = [0, ...callbackOffsetsMs, elapsedMs];
+            const gapsMs = boundaries.slice(1).map((value, index) => value - boundaries[index]);
+            const maximumGapMs = Math.max(...gapsMs);
+            const invalidReasons = [];
+            if (elapsedMs < ${RAF_PROBE_WINDOW_MS}) invalidReasons.push("observation-window-incomplete");
+            if (callbackOffsetsMs.length < ${RAF_PROBE_MIN_FRAMES}) invalidReasons.push("insufficient-animation-callbacks");
+            if (maximumGapMs >= ${RAF_PROBE_MAX_GAP_MS}) invalidReasons.push("animation-callback-gap-too-long");
             resolve({
-                frames,
-                elapsedMs: performance.now() - startedAt,
+                scope: "root-document",
+                metric: "request-animation-frame-cadence",
+                frames: callbackOffsetsMs.length,
+                elapsedMs,
+                observationWindowMs: ${RAF_PROBE_WINDOW_MS},
+                minimumFrames: ${RAF_PROBE_MIN_FRAMES},
+                maximumAllowedGapMs: ${RAF_PROBE_MAX_GAP_MS},
+                maximumGapMs,
+                callbackOffsetsMs,
+                gapsMs,
+                invalidReasons,
+                live: invalidReasons.length === 0,
             });
         };
         const tick = () => {
             if (settled) return;
-            frames += 1;
-            if (frames >= ${RAF_PROBE_MIN_FRAMES}) {
-                finish();
-                return;
-            }
-            requestAnimationFrame(tick);
+            callbackOffsetsMs.push(performance.now() - startedAt);
+            frameHandle = requestAnimationFrame(tick);
         };
-        requestAnimationFrame(tick);
-        setTimeout(finish, ${RAF_PROBE_SETTLE_MS});
-    }))()`,
+        frameHandle = requestAnimationFrame(tick);
+        setTimeout(finish, ${RAF_PROBE_WINDOW_MS});
+    }))()`;
+}
+
+async function probeAnimationFrames(webSocketUrl, timeoutMs) {
+  return await evaluate(
+    webSocketUrl,
+    animationCadenceProbeExpression(),
     Math.max(MIN_COMMAND_TIMEOUT_MS, Math.min(timeoutMs, 2500)),
   );
-  return {
-    ...result,
-    minimumFrames: RAF_PROBE_MIN_FRAMES,
-    live: result.frames >= RAF_PROBE_MIN_FRAMES,
-  };
 }
 
 async function activateTarget(
@@ -1256,9 +1273,14 @@ async function activateTarget(
     page.visibilityState === "visible"
       ? await probeAnimationFrames(target.webSocketDebuggerUrl, timeoutMs)
       : {
+          scope: "root-document",
+          metric: "request-animation-frame-cadence",
           frames: 0,
           elapsedMs: 0,
+          observationWindowMs: RAF_PROBE_WINDOW_MS,
           minimumFrames: RAF_PROBE_MIN_FRAMES,
+          maximumAllowedGapMs: RAF_PROBE_MAX_GAP_MS,
+          invalidReasons: ["page-not-visible"],
           live: false,
         };
   const fallbackReasons = [];
@@ -1298,9 +1320,14 @@ async function activateTarget(
       page.visibilityState === "visible"
         ? await probeAnimationFrames(target.webSocketDebuggerUrl, timeoutMs)
         : {
+            scope: "root-document",
+            metric: "request-animation-frame-cadence",
             frames: 0,
             elapsedMs: 0,
+            observationWindowMs: RAF_PROBE_WINDOW_MS,
             minimumFrames: RAF_PROBE_MIN_FRAMES,
+            maximumAllowedGapMs: RAF_PROBE_MAX_GAP_MS,
+            invalidReasons: ["page-not-visible"],
             live: false,
           };
   }
@@ -1706,6 +1733,52 @@ async function withCdpSession(webSocketUrl, timeoutMs, callback) {
   } finally {
     session.close();
   }
+}
+
+async function dispatchInputSequence(webSocketUrl, transaction, timeoutMs) {
+  const frozen = InputSequence.validate(transaction);
+  const targetId = pageTargetIdFromWebSocketUrl(webSocketUrl);
+  const bridge = targetId ? keepAliveBridgeForTarget(targetId) : undefined;
+  if (bridge) {
+    return sendKeepAliveBridgeCommand(
+      bridge,
+      targetId,
+      "InputSequence",
+      {},
+      timeoutMs,
+      frozen,
+    );
+  }
+  const session = await openCdpSession(webSocketUrl, timeoutMs);
+  const cancellation = new AbortController();
+  const cancel = () => cancellation.abort();
+  process.once("SIGINT", cancel);
+  process.once("SIGTERM", cancel);
+  try {
+    return await InputSequence.run(session, frozen, {
+      signal: cancellation.signal,
+    });
+  } finally {
+    process.removeListener("SIGINT", cancel);
+    process.removeListener("SIGTERM", cancel);
+    session.close();
+  }
+}
+
+function inputSequenceTransaction(events, cleanup, durationMs, options) {
+  return {
+    events,
+    cleanup,
+    durationMs,
+    maximumInFlight: integerOption(options, "max-in-flight", 128, 1, 128),
+    maximumScheduleErrorMs: integerOption(
+      options,
+      "max-dispatch-error",
+      50,
+      0,
+      1000,
+    ),
+  };
 }
 
 async function evaluate(webSocketUrl, expression, timeoutMs) {
@@ -2915,7 +2988,7 @@ function createKeepAliveCommandBridge(attachments) {
   const server = http.createServer(async (request, response) => {
     if (
       request.method !== "POST" ||
-      !["/command", "/events"].includes(request.url)
+      !["/command", "/events", "/input-sequence"].includes(request.url)
     ) {
       writeBridgeResponse(response, 404, { ok: false, error: "Not found." });
       return;
@@ -2962,6 +3035,34 @@ function createKeepAliveCommandBridge(attachments) {
         writeBridgeResponse(response, 200, { ok: true, result });
         return;
       }
+      if (request.url === "/input-sequence") {
+        const transaction = InputSequence.validate(command.transaction);
+        const cancellation = new AbortController();
+        response.once("close", () => {
+          if (!response.writableEnded) cancellation.abort();
+        });
+        const timeoutMs = validateCommandTimeout(
+          command.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+        );
+        const result = await enqueueBridgeCommand(
+          queues,
+          normalize(attachment.target.id),
+          () =>
+            InputSequence.run(
+              {
+                send(method, params) {
+                  return attachment.session.send(method, params, timeoutMs);
+                },
+              },
+              transaction,
+              { signal: cancellation.signal },
+            ),
+        );
+        if (!response.destroyed) {
+          writeBridgeResponse(response, 200, { ok: true, result });
+        }
+        return;
+      }
       if (typeof command.method !== "string" || command.method.length === 0) {
         throw new Error("Bridge command requires a method string.");
       }
@@ -2977,12 +3078,14 @@ function createKeepAliveCommandBridge(attachments) {
       const timeoutMs = validateCommandTimeout(
         command.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
       );
-      const result = await enqueueBridgeCommand(queues, command.targetId, () =>
-        attachment.session.send(command.method, params, timeoutMs),
+      const result = await enqueueBridgeCommand(
+        queues,
+        normalize(attachment.target.id),
+        () => attachment.session.send(command.method, params, timeoutMs),
       );
       writeBridgeResponse(response, 200, { ok: true, result });
     } catch (error) {
-      if (!response.writableEnded) {
+      if (!response.writableEnded && !response.destroyed) {
         writeBridgeResponse(response, 400, {
           ok: false,
           error: error.message || String(error),
@@ -3027,6 +3130,7 @@ function sendKeepAliveBridgeCommand(
   method,
   params,
   timeoutMs,
+  transaction = null,
 ) {
   return new Promise((resolve, reject) => {
     const source = JSON.stringify({
@@ -3035,12 +3139,13 @@ function sendKeepAliveBridgeCommand(
       method,
       params,
       timeoutMs,
+      ...(transaction === null ? {} : { transaction }),
     });
     const request = http.request(
       {
         host: bridge.host,
         port: bridge.port,
-        path: "/command",
+        path: transaction === null ? "/command" : "/input-sequence",
         method: "POST",
         headers: {
           "Content-Type": "application/json; charset=utf-8",
@@ -3082,7 +3187,11 @@ function sendKeepAliveBridgeCommand(
         response.on("error", reject);
       },
     );
-    request.setTimeout(timeoutMs + 1000, () => {
+    const responseTimeoutMs =
+      transaction === null
+        ? timeoutMs + 1000
+        : transaction.durationMs + 2 * timeoutMs + 1000;
+    request.setTimeout(responseTimeoutMs, () => {
       request.destroy(
         new Error(
           `Keep-alive bridge command timed out after ${timeoutMs}ms: ${method}.`,
@@ -4283,78 +4392,72 @@ async function dispatchDrag(webSocketUrl, from, to, options, timeoutMs) {
   const modifiers = mouseModifiers(options);
   const steps = integerOption(options, "steps", 12, 1, 240);
   const durationMs = integerOption(options, "duration", 200, 0, 10000);
-  const delayMs = durationMs / steps;
-  let current = from;
-
   await evaluate(webSocketUrl, cursorExpression(from.x, from.y), timeoutMs);
-  await withCdpSession(webSocketUrl, timeoutMs, async (session) => {
-    await session.send("Input.dispatchMouseEvent", {
+  await sendCdp(
+    webSocketUrl,
+    "Input.dispatchMouseEvent",
+    {
       type: "mouseMoved",
       x: from.x,
       y: from.y,
       buttons: 0,
       modifiers,
-    });
-    await session.send("Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      x: from.x,
-      y: from.y,
-      button,
-      buttons,
-      modifiers,
-      clickCount: 1,
-    });
-
-    let failure;
-    try {
-      for (let step = 1; step <= steps; step += 1) {
-        const ratio = step / steps;
-        current = {
-          x: from.x + (to.x - from.x) * ratio,
-          y: from.y + (to.y - from.y) * ratio,
-        };
-        await session.send("Input.dispatchMouseEvent", {
-          type: "mouseMoved",
-          x: current.x,
-          y: current.y,
-          button,
-          buttons,
-          modifiers,
-        });
-        if (delayMs > 0 && step < steps) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-        }
-      }
-    } catch (error) {
-      failure = error;
-    } finally {
-      try {
-        await session.send("Input.dispatchMouseEvent", {
-          type: "mouseReleased",
-          x: current.x,
-          y: current.y,
-          button,
-          buttons: 0,
-          modifiers,
-          clickCount: 1,
-        });
-      } catch (releaseError) {
-        if (!failure) {
-          throw releaseError;
-        }
-      }
-    }
-    if (failure) {
-      throw failure;
-    }
-  });
-  await evaluate(
-    webSocketUrl,
-    cursorExpression(current.x, current.y),
+    },
     timeoutMs,
   );
+  const method = "Input.dispatchMouseEvent";
+  const events = [
+    {
+      method,
+      offsetMs: 0,
+      params: {
+        type: "mousePressed",
+        x: from.x,
+        y: from.y,
+        button,
+        buttons,
+        modifiers,
+        clickCount: 1,
+      },
+    },
+  ];
+  for (let step = 1; step <= steps; step += 1) {
+    const ratio = step / steps;
+    events.push({
+      method,
+      offsetMs: durationMs * ratio,
+      params: {
+        type: "mouseMoved",
+        x: from.x + (to.x - from.x) * ratio,
+        y: from.y + (to.y - from.y) * ratio,
+        button,
+        buttons,
+        modifiers,
+      },
+    });
+  }
+  const cleanup = {
+    method,
+    params: {
+      type: "mouseReleased",
+      x: to.x,
+      y: to.y,
+      button,
+      buttons: 0,
+      modifiers,
+      clickCount: 1,
+    },
+  };
+  events.push({ ...cleanup, offsetMs: durationMs });
+  const timing = await dispatchInputSequence(
+    webSocketUrl,
+    inputSequenceTransaction(events, cleanup, durationMs, options),
+    timeoutMs,
+  );
+  if (!timing.valid) process.exitCode = 1;
+  await evaluate(webSocketUrl, cursorExpression(to.x, to.y), timeoutMs);
 
-  return { button, modifiers, steps, durationMs };
+  return { button, modifiers, steps, durationMs, timing };
 }
 
 async function dispatchPointerInput(
@@ -4396,51 +4499,46 @@ async function dispatchPointerInput(
       }
       const steps = integerOption(options, "steps", 12, 1, 240);
       const durationMs = integerOption(options, "duration", 200, 0, 10000);
-      const delayMs = durationMs / steps;
       const events = [];
-      await withCdpSession(webSocketUrl, timeoutMs, async (session) => {
-        const start = {
-          type: "touchStart",
-          touchPoints: fromPoints,
+      const method = "Input.dispatchTouchEvent";
+      const start = {
+        type: "touchStart",
+        touchPoints: fromPoints,
+        modifiers,
+      };
+      events.push(start);
+      const sequence = [{ method, offsetMs: 0, params: start }];
+      for (let step = 1; step <= steps; step += 1) {
+        const move = {
+          type: "touchMove",
+          touchPoints: interpolateTouchPoints(
+            fromPoints,
+            toPoints,
+            step / steps,
+          ),
           modifiers,
         };
-        events.push(start);
-        await session.send("Input.dispatchTouchEvent", start);
-        let failure;
-        try {
-          for (let step = 1; step <= steps; step += 1) {
-            const move = {
-              type: "touchMove",
-              touchPoints: interpolateTouchPoints(
-                fromPoints,
-                toPoints,
-                step / steps,
-              ),
-              modifiers,
-            };
-            events.push(move);
-            await session.send("Input.dispatchTouchEvent", move);
-            if (delayMs > 0 && step < steps) {
-              await new Promise((resolve) => setTimeout(resolve, delayMs));
-            }
-          }
-        } catch (error) {
-          failure = error;
-        } finally {
-          const end = {
-            type: failure ? "touchCancel" : "touchEnd",
-            touchPoints: [],
-            modifiers,
-          };
-          events.push(end);
-          try {
-            await session.send("Input.dispatchTouchEvent", end);
-          } catch (endError) {
-            if (!failure) throw endError;
-          }
-        }
-        if (failure) throw failure;
-      });
+        events.push(move);
+        sequence.push({
+          method,
+          offsetMs: (durationMs * step) / steps,
+          params: move,
+        });
+      }
+      const end = {
+        type: "touchEnd",
+        touchPoints: [],
+        modifiers,
+      };
+      events.push(end);
+      sequence.push({ method, offsetMs: durationMs, params: end });
+      const cleanup = { method, params: { ...end, type: "touchCancel" } };
+      const timing = await dispatchInputSequence(
+        webSocketUrl,
+        inputSequenceTransaction(sequence, cleanup, durationMs, options),
+        timeoutMs,
+      );
+      if (!timing.valid) process.exitCode = 1;
       return {
         pointerType: type,
         action,
@@ -4448,6 +4546,7 @@ async function dispatchPointerInput(
         steps,
         durationMs,
         events,
+        timing,
       };
     }
 
@@ -4507,69 +4606,59 @@ async function dispatchPointerInput(
     }
     const steps = integerOption(options, "steps", 12, 1, 240);
     const durationMs = integerOption(options, "duration", 200, 0, 10000);
-    const delayMs = durationMs / steps;
     const events = [];
-    await withCdpSession(webSocketUrl, timeoutMs, async (session) => {
-      const down = {
-        type: "mousePressed",
-        x: locations.from.x,
-        y: locations.from.y,
+    const method = "Input.dispatchMouseEvent";
+    const down = {
+      type: "mousePressed",
+      x: locations.from.x,
+      y: locations.from.y,
+      button,
+      buttons: buttonMask,
+      modifiers,
+      pointerType: type,
+      ...geometry,
+      clickCount: 0,
+    };
+    events.push(down);
+    const sequence = [{ method, offsetMs: 0, params: down }];
+    for (let step = 1; step <= steps; step += 1) {
+      const ratio = step / steps;
+      const current = {
+        x: locations.from.x + (locations.to.x - locations.from.x) * ratio,
+        y: locations.from.y + (locations.to.y - locations.from.y) * ratio,
+      };
+      const move = {
+        type: "mouseMoved",
+        ...current,
         button,
         buttons: buttonMask,
         modifiers,
         pointerType: type,
         ...geometry,
-        clickCount: 0,
       };
-      events.push(down);
-      await session.send("Input.dispatchMouseEvent", down);
-      let failure;
-      let current = locations.from;
-      try {
-        for (let step = 1; step <= steps; step += 1) {
-          const ratio = step / steps;
-          current = {
-            x: locations.from.x + (locations.to.x - locations.from.x) * ratio,
-            y: locations.from.y + (locations.to.y - locations.from.y) * ratio,
-          };
-          const move = {
-            type: "mouseMoved",
-            ...current,
-            button,
-            buttons: buttonMask,
-            modifiers,
-            pointerType: type,
-            ...geometry,
-          };
-          events.push(move);
-          await session.send("Input.dispatchMouseEvent", move);
-          if (delayMs > 0 && step < steps) {
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
-          }
-        }
-      } catch (error) {
-        failure = error;
-      } finally {
-        const up = {
-          type: "mouseReleased",
-          ...current,
-          button,
-          buttons: 0,
-          modifiers,
-          pointerType: type,
-          ...geometry,
-          force: 0,
-          clickCount: 0,
-        };
-        events.push(up);
-        try {
-          await session.send("Input.dispatchMouseEvent", up);
-        } catch (upError) {
-          if (!failure) throw upError;
-        }
-      }
-      if (failure) throw failure;
-    });
+      events.push(move);
+      sequence.push({ method, offsetMs: durationMs * ratio, params: move });
+    }
+    const up = {
+      type: "mouseReleased",
+      ...locations.to,
+      button,
+      buttons: 0,
+      modifiers,
+      pointerType: type,
+      ...geometry,
+      force: 0,
+      clickCount: 0,
+    };
+    events.push(up);
+    const cleanup = { method, params: up };
+    sequence.push({ ...cleanup, offsetMs: durationMs });
+    const timing = await dispatchInputSequence(
+      webSocketUrl,
+      inputSequenceTransaction(sequence, cleanup, durationMs, options),
+      timeoutMs,
+    );
+    if (!timing.valid) process.exitCode = 1;
     return {
       pointerType: type,
       action,
@@ -4577,6 +4666,7 @@ async function dispatchPointerInput(
       steps,
       durationMs,
       events,
+      timing,
     };
   }
 

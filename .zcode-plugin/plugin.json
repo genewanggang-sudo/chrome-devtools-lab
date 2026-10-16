@@ -1,6 +1,6 @@
 {
   "name": "chrome-devtools-lab",
-  "version": "0.1.1",
+  "version": "0.2.7",
   "description": "A maintainable Chrome browser testing, debugging, control, and performance-analysis toolkit.",
   "author": {
     "name": "Gene Wang",
@@ -39,21 +39,16 @@
   },
   "mcpServers": {
     "chrome-devtools": {
-      "command": "npx",
+      "command": "node",
+      "cwd": ".",
       "args": [
-        "-y",
-        "chrome-devtools-mcp@1.7.0",
+        "scripts/devtools-mcp.mjs",
         "--browserUrl",
         "http://127.0.0.1:9333",
-        "--experimentalPageIdRouting",
+        "--pageIdRouting",
         "--experimentalDevtools",
-        "--experimentalVision",
-        "--memoryDebugging",
         "--experimentalStructuredContent",
-        "--experimentalScreencast",
-        "--categoryExtensions",
-        "--categoryExperimentalThirdParty",
-        "--categoryExperimentalWebmcp",
+        "--no-category-memory",
         "--no-usage-statistics",
         "--no-performance-crux",
         "--redactNetworkHeaders"

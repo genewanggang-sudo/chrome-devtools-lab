@@ -8,6 +8,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 function parseArgs(argv) {
   const options = {};
@@ -51,30 +52,97 @@ function round1(value) {
   return Math.round(value * 10) / 10;
 }
 
-function aggregate(profile) {
+export function aggregate(profile) {
   const nodes = profile.nodes || [];
-  const samples = profile.samples || [];
-  const timeDeltas = profile.timeDeltas || [];
+  let samples = profile.samples || [];
+  let timeDeltas = profile.timeDeltas || [];
   if (!Array.isArray(nodes) || nodes.length === 0) {
     throw new Error("Profile has no nodes");
   }
 
+  if (!Array.isArray(samples) || !Array.isArray(timeDeltas)) {
+    throw new Error("Profile samples and timeDeltas must be arrays");
+  }
   const byId = new Map();
-  for (const node of nodes) byId.set(node.id, node);
+  for (const node of nodes) {
+    if (!Number.isInteger(node.id) || byId.has(node.id)) {
+      throw new Error(
+        `Profile has an invalid or duplicate node ID: ${node.id}`,
+      );
+    }
+    byId.set(node.id, node);
+  }
 
-  // Self time: attribute each inter-sample delta to the sampled node.
-  let attribution = "timeDeltas";
-  let hasDeltas = Array.isArray(timeDeltas) && timeDeltas.length > 0;
+  // Keep counts distinct from measured microseconds. A profile without deltas
+  // cannot establish elapsed time, even when startTime/endTime are present.
+  const timed = timeDeltas.length > 0;
+  let attribution = timed ? "timeDeltas" : "sampleCount";
   const selfUs = new Map();
-  if (hasDeltas) {
+  let normalization = { negativeDeltaCount: 0, reorderedSampleCount: 0 };
+  if (timed) {
+    if (samples.length !== timeDeltas.length) {
+      throw new Error(
+        "Profile samples/timeDeltas length mismatch; timing is incomplete",
+      );
+    }
+    let timestamp = 0;
+    const timestampedSamples = [];
     for (let index = 0; index < samples.length; index += 1) {
       const id = samples[index];
-      const delta = Math.max(0, Number(timeDeltas[index] || 0));
+      const delta = timeDeltas[index];
+      if (!byId.has(id))
+        throw new Error(`Sample references unknown node: ${id}`);
+      if (typeof delta !== "number" || !Number.isFinite(delta)) {
+        throw new Error(
+          `Invalid timeDeltas[${index}]: expected finite microseconds`,
+        );
+      }
+      timestamp += delta;
+      if (timestamp < 0)
+        throw new Error(
+          `Invalid timeDeltas[${index}]: sample precedes profile start`,
+        );
+      if (delta < 0) normalization.negativeDeltaCount += 1;
+      timestampedSamples.push({ id, timestamp, originalIndex: index });
+    }
+    if (normalization.negativeDeltaCount > 0) {
+      // DevTools CPUProfileDataModel.sortSamples also reconstructs cumulative
+      // timestamps then sorts samples together with their timestamps. Preserve
+      // elapsed duration instead of silently replacing negative deltas with 0.
+      timestampedSamples.sort(
+        (left, right) => left.timestamp - right.timestamp,
+      );
+      let previousTimestamp = 0;
+      samples = [];
+      timeDeltas = [];
+      for (const [index, sample] of timestampedSamples.entries()) {
+        samples.push(sample.id);
+        timeDeltas.push(sample.timestamp - previousTimestamp);
+        previousTimestamp = sample.timestamp;
+        if (sample.originalIndex !== index)
+          normalization.reorderedSampleCount += 1;
+      }
+    }
+    for (let index = 0; index < samples.length; index += 1) {
+      const id = samples[index];
+      const delta = timeDeltas[index];
       selfUs.set(id, (selfUs.get(id) || 0) + delta);
     }
-  } else if (typeof nodes[0].hitCount === "number") {
+  } else if (samples.length > 0) {
+    for (const id of samples) {
+      if (!byId.has(id))
+        throw new Error(`Sample references unknown node: ${id}`);
+      selfUs.set(id, (selfUs.get(id) || 0) + 1);
+    }
+  } else if (nodes.some((node) => typeof node.hitCount === "number")) {
     attribution = "hitCount";
     for (const node of nodes) {
+      if (
+        node.hitCount != null &&
+        (!Number.isInteger(node.hitCount) || node.hitCount < 0)
+      ) {
+        throw new Error(`Invalid hitCount for node ${node.id}`);
+      }
       if (node.hitCount > 0) selfUs.set(node.id, node.hitCount);
     }
   } else {
@@ -86,35 +154,44 @@ function aggregate(profile) {
   const parentOf = new Map();
   for (const node of nodes) {
     for (const childId of node.children || []) {
+      if (!byId.has(childId))
+        throw new Error(`Node references unknown child: ${childId}`);
+      if (parentOf.has(childId))
+        throw new Error(`Node has multiple parent references: ${childId}`);
       parentOf.set(childId, node.id);
     }
   }
-
-  // Total time per node: iterative post-order over children.
-  const totalUs = new Map();
-  const state = new Map();
-  const work = [];
+  // Validate the tree before walking sampled stacks (including unsampled nodes).
+  const verified = new Set();
   for (const node of nodes) {
-    if (!parentOf.has(node.id)) work.push(node.id);
+    const visiting = new Set();
+    let cursor = node.id;
+    while (cursor !== undefined && !verified.has(cursor)) {
+      if (visiting.has(cursor))
+        throw new Error(`Profile node tree contains a cycle: ${cursor}`);
+      visiting.add(cursor);
+      cursor = parentOf.get(cursor);
+    }
+    for (const id of visiting) verified.add(id);
   }
-  if (work.length === 0) work.push(nodes[0].id);
-  while (work.length > 0) {
-    const id = work[work.length - 1];
-    const phase = state.get(id) || 0;
-    if (phase === 0) {
-      state.set(id, 1);
-      const node = byId.get(id);
-      for (const childId of node.children || []) {
-        if (byId.has(childId)) work.push(childId);
+
+  // Call-tree nodes retain their own inclusive values for the flamegraph.
+  // Logical function totals are a stack union: recursive appearances in the
+  // same sample count once. Grouping weights by leaf first is equivalent to
+  // visiting every sample, and avoids repeatedly walking identical stacks.
+  const totalUs = new Map();
+  const functionTotalUs = new Map();
+  for (const [leafId, weight] of selfUs) {
+    const seenFunctions = new Set();
+    let cursor = leafId;
+    while (cursor !== undefined) {
+      const key = frameKey(byId.get(cursor).callFrame || {});
+      totalUs.set(cursor, (totalUs.get(cursor) || 0) + weight);
+      if (!seenFunctions.has(key)) {
+        functionTotalUs.set(key, (functionTotalUs.get(key) || 0) + weight);
+        seenFunctions.add(key);
       }
-    } else {
-      work.pop();
-      const node = byId.get(id);
-      let sum = selfUs.get(id) || 0;
-      for (const childId of node.children || []) {
-        sum += totalUs.get(childId) || 0;
-      }
-      totalUs.set(id, sum);
+      cursor = parentOf.get(cursor);
     }
   }
 
@@ -128,7 +205,6 @@ function aggregate(profile) {
     const callFrame = node.callFrame || {};
     const key = frameKey(callFrame);
     const nodeSelf = selfUs.get(node.id) || 0;
-    const nodeTotal = totalUs.get(node.id) || 0;
 
     let fn = functions.get(key);
     if (!fn) {
@@ -138,14 +214,13 @@ function aggregate(profile) {
         line: (callFrame.lineNumber ?? -1) + 1,
         column: (callFrame.columnNumber ?? -1) + 1,
         selfUs: 0,
-        totalUs: 0,
+        totalUs: functionTotalUs.get(key) || 0,
         nodeCount: 0,
         callFrame,
       };
       functions.set(key, fn);
     }
     fn.selfUs += nodeSelf;
-    fn.totalUs += nodeTotal;
     fn.nodeCount += 1;
 
     if (callFrame.url) {
@@ -179,12 +254,11 @@ function aggregate(profile) {
     url: fn.url,
     line: fn.line,
     column: fn.column,
-    selfMs: round1(fn.selfUs / 1000),
-    totalMs: round1(fn.totalUs / 1000),
+    selfMs: timed ? round1(fn.selfUs / 1000) : null,
+    totalMs: timed ? round1(fn.totalUs / 1000) : null,
+    ...(!timed ? { selfCount: fn.selfUs, totalCount: fn.totalUs } : {}),
     selfPercent:
-      totalProfiledUs > 0
-        ? round1((fn.selfUs / totalProfiledUs) * 100)
-        : 0,
+      totalProfiledUs > 0 ? round1((fn.selfUs / totalProfiledUs) * 100) : 0,
     nodeCount: fn.nodeCount,
   });
   const toLineRow = (ln) => ({
@@ -192,11 +266,10 @@ function aggregate(profile) {
     line: ln.line,
     column: ln.column,
     functionName: ln.functionName,
-    selfMs: round1(ln.selfUs / 1000),
+    selfMs: timed ? round1(ln.selfUs / 1000) : null,
+    ...(!timed ? { selfCount: ln.selfUs } : {}),
     selfPercent:
-      totalProfiledUs > 0
-        ? round1((ln.selfUs / totalProfiledUs) * 100)
-        : 0,
+      totalProfiledUs > 0 ? round1((ln.selfUs / totalProfiledUs) * 100) : 0,
     nodeCount: ln.nodeCount,
   });
 
@@ -210,28 +283,113 @@ function aggregate(profile) {
     byId,
     totalProfiledUs,
     attribution,
+    timed,
+    quality: describeProfileQuality(
+      profile,
+      timed,
+      totalProfiledUs,
+      timeDeltas,
+      normalization,
+    ),
     samples,
     timeDeltas,
     hotFunctions: functionRows.sort(bySelf),
     expensiveFunctions: functionRows.slice().sort(byTotal),
-    hotLines: [...lines.values()]
-      .sort(bySelf)
-      .map(toLineRow),
-    hotUrls: [...urls.values()]
-      .sort(bySelf)
-      .map((u) => ({
-        url: u.url,
-        selfMs: round1(u.selfUs / 1000),
-        selfPercent:
-          totalProfiledUs > 0
-            ? round1((u.selfUs / totalProfiledUs) * 100)
-            : 0,
-      })),
+    hotLines: [...lines.values()].sort(bySelf).map(toLineRow),
+    hotUrls: [...urls.values()].sort(bySelf).map((u) => ({
+      url: u.url,
+      selfMs: timed ? round1(u.selfUs / 1000) : null,
+      ...(!timed ? { selfCount: u.selfUs } : {}),
+      selfPercent:
+        totalProfiledUs > 0 ? round1((u.selfUs / totalProfiledUs) * 100) : 0,
+    })),
     toFunctionRow,
   };
 }
 
-function buildSpeedscope(profile, aggregated, inputName) {
+function describeProfileQuality(
+  profile,
+  timed,
+  totalWeight,
+  deltas,
+  normalization,
+) {
+  const warnings = [];
+  if (!timed) {
+    warnings.push(
+      "Timing deltas are unavailable: values are counts, not elapsed time; no temporal order can be inferred from hit counts.",
+    );
+    return { timingAvailable: false, warnings };
+  }
+  if (normalization.negativeDeltaCount > 0) {
+    warnings.push(
+      "Negative raw deltas were normalized by sorting cumulative timestamps and their samples together, matching DevTools sample-order normalization; raw input is unchanged. This report attributes each interval to its ending sample rather than claiming exact DevTools trace-engine equivalence.",
+    );
+  }
+  const ordered = deltas
+    .filter((value) => value > 0)
+    .sort((left, right) => left - right);
+  const medianUs =
+    ordered.length > 0 ? ordered[Math.floor(ordered.length / 2)] : 0;
+  const gapThresholdUs = Math.max(50000, medianUs * 10);
+  const largeGaps = deltas.filter((value) => value > gapThresholdUs);
+  const boundsAvailable =
+    Number.isFinite(profile.startTime) &&
+    Number.isFinite(profile.endTime) &&
+    profile.endTime >= profile.startTime;
+  const durationUs = boundsAvailable
+    ? profile.endTime - profile.startTime
+    : null;
+  if (!boundsAvailable)
+    warnings.push(
+      "Valid startTime/endTime are unavailable; capture-window coverage cannot be checked.",
+    );
+  if (
+    durationUs !== null &&
+    Math.abs(durationUs - totalWeight) > Math.max(5000, durationUs * 0.01)
+  ) {
+    warnings.push(
+      "Attributed sample duration differs from the capture bounds by more than 1% or 5ms; do not interpret the sample sum as complete capture coverage.",
+    );
+  }
+  if (largeGaps.length > 0) {
+    warnings.push(
+      "Large inter-sample gaps exist; their elapsed time is attributed to a sampled stack and is not proof of continuous CPU execution or lost events.",
+    );
+  }
+  if (totalWeight === 0)
+    warnings.push(
+      "All sample deltas are zero; no elapsed time can be attributed.",
+    );
+  return {
+    timingAvailable: true,
+    profileDurationMs: durationUs === null ? null : round1(durationUs / 1000),
+    attributedSampleTimeMs: round1(totalWeight / 1000),
+    unrepresentedDurationMs:
+      durationUs === null
+        ? null
+        : round1(Math.max(0, durationUs - totalWeight) / 1000),
+    sampleDurationOverrunMs:
+      durationUs === null
+        ? null
+        : round1(Math.max(0, totalWeight - durationUs) / 1000),
+    coverageRatio: durationUs > 0 ? totalWeight / durationUs : null,
+    medianIntervalUs: medianUs,
+    largestIntervalUs: deltas.reduce(
+      (maximum, value) => Math.max(maximum, value),
+      0,
+    ),
+    largeGapThresholdUs: gapThresholdUs,
+    largeGapCount: largeGaps.length,
+    largeGapTimeMs: round1(
+      largeGaps.reduce((sum, value) => sum + value, 0) / 1000,
+    ),
+    ...normalization,
+    warnings,
+  };
+}
+
+export function buildSpeedscope(profile, aggregated, inputName) {
   const frameIndexByKey = new Map();
   const frames = [];
   const frameIndexOf = (callFrame) => {
@@ -257,9 +415,16 @@ function buildSpeedscope(profile, aggregated, inputName) {
   const weights = [];
   const { selfUs, parentOf, byId } = aggregated;
   const { samples: rawSamples, timeDeltas } = aggregated;
-  for (let index = 0; index < rawSamples.length; index += 1) {
+  const weightedSamples =
+    rawSamples.length > 0
+      ? rawSamples.map((id, index) => [
+          id,
+          aggregated.timed ? timeDeltas[index] : 1,
+        ])
+      : [...selfUs.entries()];
+  for (const [id, weight] of weightedSamples) {
     const stack = [];
-    let cursor = rawSamples[index];
+    let cursor = id;
     while (cursor !== undefined) {
       const node = byId.get(cursor);
       if (!node) break;
@@ -268,7 +433,7 @@ function buildSpeedscope(profile, aggregated, inputName) {
     }
     stack.reverse(); // speedscope expects root -> leaf order.
     samples.push(stack);
-    weights.push(Math.max(0, Number(timeDeltas[index] || 0)));
+    weights.push(weight);
   }
 
   return {
@@ -277,8 +442,11 @@ function buildSpeedscope(profile, aggregated, inputName) {
     profiles: [
       {
         type: "sampled",
-        name: inputName,
-        unit: "microseconds",
+        name:
+          aggregated.attribution === "hitCount"
+            ? `${inputName} (unordered hit counts)`
+            : inputName,
+        unit: aggregated.timed ? "microseconds" : "none",
         startValue: 0,
         endValue: aggregated.totalProfiledUs,
         samples,
@@ -288,7 +456,7 @@ function buildSpeedscope(profile, aggregated, inputName) {
   };
 }
 
-function buildFlamegraphData(profile, aggregated) {
+export function buildFlamegraphData(profile, aggregated) {
   const { selfUs, totalUs, parentOf, byId, totalProfiledUs } = aggregated;
   const roots = [];
   for (const node of profile.nodes) {
@@ -317,8 +485,12 @@ function buildFlamegraphData(profile, aggregated) {
       n: callFrame.functionName || "(anonymous)",
       u: callFrame.url || "",
       l: (callFrame.lineNumber ?? -1) + 1,
-      s: round1((selfUs.get(id) || 0) / 1000),
-      t: round1((totalUs.get(id) || 0) / 1000),
+      s: aggregated.timed
+        ? round1((selfUs.get(id) || 0) / 1000)
+        : selfUs.get(id) || 0,
+      t: aggregated.timed
+        ? round1((totalUs.get(id) || 0) / 1000)
+        : totalUs.get(id) || 0,
     });
     let childX = x0;
     const children = (node.children || []).filter((childId) =>
@@ -335,14 +507,18 @@ function buildFlamegraphData(profile, aggregated) {
     }
   }
   return {
-    totalMs: round1(totalProfiledUs / 1000),
+    totalMs: aggregated.timed ? round1(totalProfiledUs / 1000) : null,
+    totalCount: aggregated.timed ? null : totalProfiledUs,
+    unit: aggregated.timed ? "ms" : "count",
     rects,
   };
 }
 
 function flamegraphHtml(data, hotLines, title) {
-  const payload = JSON.stringify({ data, hotLines: hotLines.slice(0, 12) })
-    .replace(/</g, "\\u003c");
+  const payload = JSON.stringify({
+    data,
+    hotLines: hotLines.slice(0, 12),
+  }).replace(/</g, "\\u003c");
   return `<!doctype html>
 <html>
 <head>
@@ -365,11 +541,14 @@ function flamegraphHtml(data, hotLines, title) {
 <div class="meta" id="meta"></div>
 <svg id="chart" height="0"></svg>
 <div id="tooltip"></div>
-<table id="hotlines"><thead><tr><th>self ms</th><th>location</th><th>function</th></tr></thead><tbody></tbody></table>
+<table id="hotlines"><thead><tr><th id="self-unit">self ms</th><th>location</th><th>function</th></tr></thead><tbody></tbody></table>
 <script>
 const payload = ${payload};
 const meta = document.getElementById("meta");
-meta.textContent = "profiled self time total: " + payload.data.totalMs + " ms; rows below are the top lines by self time.";
+const unit = payload.data.unit;
+meta.textContent = "Aggregate call tree (not a chronological timeline). Total: " +
+  (unit === "ms" ? payload.data.totalMs : payload.data.totalCount) + " " + unit + "; rows below group sampled function definition locations, not executing statements.";
+document.getElementById("self-unit").textContent = "self " + unit;
 const ROW = 18;
 const rects = payload.data.rects;
 const chart = document.getElementById("chart");
@@ -398,14 +577,14 @@ for (const rect of rects) {
   element.setAttribute("fill", gray ? "#b0b0b0" : "hsl(" + hue(rect.u || rect.n) + ", 65%, " + (78 - Math.min(rect.d, 6) * 4) + "%)");
   element.setAttribute("stroke", "#ffffff");
   element.appendChild(Object.assign(document.createElementNS(svgns, "title"), {
-    textContent: rect.n + "\\n" + (rect.u ? rect.u + ":" + rect.l : "(no url)") + "\\nself " + rect.s + " ms / total " + rect.t + " ms"
+    textContent: rect.n + "\\n" + (rect.u ? rect.u + ":" + rect.l : "(no url)") + "\\nself " + rect.s + " " + unit + " / total " + rect.t + " " + unit
   }));
   element.addEventListener("mousemove", (event) => {
     tooltip.style.display = "block";
     tooltip.style.left = event.clientX + 12 + "px";
     tooltip.style.top = event.clientY + 12 + "px";
     tooltip.innerHTML = "<b>" + rect.n + "</b><br>" + (rect.u ? rect.u + ":" + rect.l : "(no url)") +
-      "<br>self " + rect.s + " ms / total " + rect.t + " ms";
+      "<br>self " + rect.s + " " + unit + " / total " + rect.t + " " + unit;
   });
   element.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
   chart.appendChild(element);
@@ -413,7 +592,7 @@ for (const rect of rects) {
 const tbody = document.querySelector("#hotlines tbody");
 for (const line of payload.hotLines) {
   const row = document.createElement("tr");
-  const cells = [String(line.selfMs), line.url + ":" + line.line, line.functionName];
+  const cells = [String(unit === "ms" ? line.selfMs : line.selfCount), line.url + ":" + line.line, line.functionName];
   for (const text of cells) {
     const cell = document.createElement("td");
     cell.textContent = text;
@@ -453,7 +632,9 @@ async function main() {
     throw new Error("Input is not a .cpuprofile (missing nodes[])");
   }
   const aggregated = aggregate(profile);
-  const profiledMs = round1(aggregated.totalProfiledUs / 1000);
+  const profiledMs = aggregated.timed
+    ? round1(aggregated.totalProfiledUs / 1000)
+    : null;
 
   const summary = {
     ok: true,
@@ -461,13 +642,21 @@ async function main() {
     meta: {
       profiledSelfTimeMs: profiledMs,
       attribution: aggregated.attribution,
+      unit: aggregated.timed ? "milliseconds" : "count",
+      ...(!aggregated.timed
+        ? { profiledSampleCount: aggregated.totalProfiledUs }
+        : {}),
+      quality: aggregated.quality,
       sampleCount: aggregated.samples.length,
       nodeCount: profile.nodes.length,
       samplingIntervalNote:
-        "V8 samples the stack on an interval; self time is the sum of inter-sample deltas attributed to the sampled node. Sampling attributes time to functions: line/column mark the sampled function's definition position (the jump target in editors/DevTools), not the individual executing statement. For statement-level frequency, capture with capture-cpu-profile.mjs --coverage.",
-      convention: "line/column are 1-based for direct use in editors and DevTools",
+        "V8 samples stacks on an interval. With timeDeltas, self time sums deltas assigned to sampled nodes; logical function total time counts a function only once per sampled stack, including recursion. Without deltas, only counts are reported. line/column mark function definition positions in captured/generated scripts, not executing statements or source-mapped TypeScript. Optional precise coverage reports instrumented range counts, not exact statement frequencies or elapsed time.",
+      convention:
+        "line/column are 1-based for direct use in editors and DevTools",
     },
-    hotFunctions: aggregated.hotFunctions.slice(0, limit).map(aggregated.toFunctionRow),
+    hotFunctions: aggregated.hotFunctions
+      .slice(0, limit)
+      .map(aggregated.toFunctionRow),
     expensiveByTotalTime: aggregated.expensiveFunctions
       .slice(0, limit)
       .map(aggregated.toFunctionRow),
@@ -508,6 +697,7 @@ async function main() {
         output: path.resolve(output),
         extraOutputs: written.filter((p) => p !== path.resolve(output)),
         profiledSelfTimeMs: profiledMs,
+        quality: aggregated.quality,
         sampleCount: aggregated.samples.length,
         topFunctions: aggregated.hotFunctions
           .slice(0, 5)
@@ -520,7 +710,12 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error.message || error}\n`);
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error.message || error}\n`);
+    process.exitCode = 1;
+  });
+}

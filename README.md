@@ -5,7 +5,7 @@ Chrome browser control and performance evidence tooling for Codex. The plugin co
 ## Requirements
 
 - Codex Desktop or Codex CLI with plugin support.
-- Node.js supported by `chrome-devtools-mcp@1.7.0`: `^20.19.0`, `^22.12.0`, or `>=23`.
+- Node.js supported by `chrome-devtools-mcp@1.10.1`: `^20.19.0`, `^22.12.0`, or `>=23`.
 - Google Chrome started with a dedicated remote-debugging endpoint at `http://127.0.0.1:9333`.
 - Windows PowerShell for the dedicated Chrome lifecycle, foreground native-wheel
   input, and the optional PresentMon backend.
@@ -64,6 +64,117 @@ is referenced.
 manifests use inline `mcpServers`. When the MCP configuration changes, update
 `.mcp.json` and the inline `mcpServers` block together, and bump `version` in
 both manifests so each host sees the upgrade.
+
+## Native Performance Recording
+
+For a complete reload diagnosis, prefer one native transaction:
+
+```powershell
+node scripts/performance.mjs native-record --config C:\project\loading-scenario.json
+```
+
+The project-owned JSON supplies `targetId`, a new `outputDir`, and `stopWhen`
+(a JavaScript boolean expression). Optional `initScript` installs the project's
+readiness observer before navigation; `observationExpression` saves its observed
+milestones. No application selectors or loading rules belong in the plugin.
+The command reuses Chrome's actual Performance panel, undocks it before freezing
+the page viewport, starts ordinary native Record, immediately reloads with existing
+caches, and stops after readiness remains true for `stableMs` (default 250).
+`pollMs` defaults to 100; `maxDurationMs` defaults to 180000. An already-ready old
+document cannot end the new recording. Timeouts preserve diagnostic artifacts.
+
+`analysisQueries` accepts 1–10 uniquely named queries. Each can specify `startMs` /
+`endMs` or `startMark` / `endMark`, plus existing thread/tree options. Marks must be
+unique in the selected frame. All query windows directly reuse the completed
+recording already parsed by Chrome's Performance panel; there is no second parse.
+The first summary is saved and printed before exporting the complete raw trace.
+Every query checks that the selected recording has not changed. The first report is
+`report.json` / `summary.json`; subsequent ones are `<name>.report.json` and
+`<name>.report.summary.json`. The bounded summaries include both self-time and
+inclusive-time rankings; inclusive rows overlap and must not be summed.
+
+Progress is printed to stderr. `run.json` records connection, recording start,
+application wait, native stop/processing, native-session setup, query and export
+timings. `firstSummaryMs` measures time until the first saved summary, while
+`totalMs` also includes the full evidence archive. Reports record `parseCount: 0`
+and `reusedNativeParse: true`. The run also records native export batch counts,
+viewport validity, observations, and evidence
+paths. Page and native-panel screenshots are saved directly after recording stops.
+The raw recording remains unchanged. After export, saved reports receive the
+archive's exact byte count, SHA-256 and capture validity. The native session
+releases its remote handle when done; Chrome retains the recording for inspection.
+
+Use Chrome's own Performance panel for ordinary profiling. The plugin opens
+that panel on an exact target, operates its native recording controls, and
+reads the completed recording already in the panel. No replacement timeline
+or manual export/import step is required:
+
+```powershell
+node scripts/performance.mjs open --target-exact TARGET_ID
+node scripts/performance.mjs native-start --target-exact TARGET_ID
+# Operate or reload the page; clicking Record/Stop yourself also works.
+node scripts/performance.mjs native-stop --target-exact TARGET_ID
+node scripts/performance.mjs analyze-current --target-exact TARGET_ID --output-dir C:\evidence\new-run
+```
+
+`analyze-current` first queries the panel's existing parsed recording using that
+Chrome version's native Call tree/Bottom-up algorithms, then preserves the complete
+raw recording. It saves and prints the first summary before archive transfer;
+`result.json` separates `firstSummaryMs` from `totalMs`. The panel remains the
+interactive viewer. Reports include thread
+ownership, JS samples, main-thread tasks, network, GC, user timing, screenshots
+and native insights when those tracks exist. Optional `--start-ms` and
+`--end-ms` restrict the query. Report positions use generated-source coordinates;
+source maps saved in the original recording remain available in Chrome's UI. Missing tracks
+are disclosed, not fabricated. Native frontend automation checks its supported
+capabilities and fails explicitly when a Chrome update changes them.
+
+Read the small `summary.json` first for thread totals, top hotspots, long tasks,
+slow requests and coverage limits. The full `report.json` and raw trace remain
+on disk for targeted follow-up; do not send the entire report into a conversation.
+
+The first analysis pass calculates native tree roots and Bottom-up function
+hotspots without expanding call chains. It preserves all trace events and the
+same function timing calculations. Add `--expand-call-tree` after narrowing to
+a relevant time range, process, or thread when caller relationships are needed.
+Expanded trees are bounded by `--max-nodes 100 --max-depth 10`; each descendant
+can rescan the thread events, so do not expand every tree for an overview.
+
+For unattended reloads, a separate native-CDP workflow can stop when an
+application-provided condition stays true. URLs, conditions, milestones and
+revision strings belong in the project's configuration, not this plugin:
+
+```powershell
+node scripts/performance.mjs record --target-exact TARGET_ID --reload `
+  --until "window.appReady === true" --stable 500 --max-duration 600000 `
+  --output-dir C:\evidence\new-load
+node scripts/performance.mjs analyze --input C:\evidence\new-load\trace.json `
+  --capture C:\evidence\new-load\capture.json --output C:\evidence\new-load\report.json
+```
+
+`start`/`stop --session <directory>` also support manual timing without a panel.
+Output directories are exclusive, raw trace bytes stream directly to disk,
+and timeout/error samples retain their artifacts and invalid reasons. Defaults
+include JS sampling and screenshots; `--screenshots false` omits screenshots.
+`--cache disable-http` disables only HTTP caching; it does not establish a
+cold IndexedDB, service-worker, OS, DNS or server cache. Never run two recorders
+on the same Chrome endpoint at once. Diagnostic recording has overhead and
+must be separate from a final timing/FPS comparison.
+
+Saved-file analysis (`analyze --input`) and the MCP runtime are pinned to
+`chrome-devtools-mcp@1.10.1`; native-panel queries use the running Chrome's own
+TraceEngine and report its browser version. Development checkouts can use `npm ci
+--ignore-scripts`. Installed plugin caches resolve the same runtime through a
+one-time user-cache installation; later recordings reuse it. Set
+`CHROME_LAB_NO_RUNTIME_INSTALL=1` to require a preinstalled runtime.
+
+The MCP launcher uses that same pinned runtime directly in one Node process,
+including installed plugin caches without `node_modules`. It avoids an `npx`
+and shell process chain per session. The default MCP configuration exposes
+page, input, network, debugging and performance tools; experimental vision,
+screencast, memory, extension, third-party and WebMCP tools are not enabled.
+This reduces tool metadata sent to the calling agent. It does not change raw
+Performance recordings or the official analysis engine.
 
 ## Configured Wheel Comparison
 

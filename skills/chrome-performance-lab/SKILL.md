@@ -17,6 +17,93 @@ parent of `skills/`).
 Use this skill for performance diagnosis. Do not reduce the task to a single
 page timer or a single FPS sample.
 
+## Native Performance first
+
+For a requested complete reload/loading diagnosis, prefer a single transaction:
+
+```powershell
+node "<plugin-root>/scripts/performance.mjs" native-record --config <project-scenario.json>
+```
+
+Supply project-owned `targetId`, a new `outputDir`, `stopWhen`, and optionally
+`initScript` / `observationExpression`. Use `analysisQueries` with unique safe
+`name` values and `startMark` / `endMark` (or millisecond bounds) to select the
+actual loading phase. The command uses ordinary native Record + immediate reload,
+waits for a new document's stable readiness, then stops and processes the same
+native recording. It undocks the panel, validates viewport/DPR, and directly
+queries Chrome's existing parsed result for all configured windows. The first
+summary is saved and printed before the complete raw recording is exported;
+there is no second parse. Every query checks the selected recording identity.
+Default readiness stability is
+250ms, poll interval 100ms, deadline 180s; polling resolution and recording
+overhead must be disclosed. Keep URLs, selectors, observers and readiness
+definitions in project configuration. Initial display is not complete refinement.
+
+Read `run.json` for separate timings, validity, observations, query paths and
+screenshots. Read the first query's `summary.json` before the full report. It
+contains both self-time and inclusive-time hotspot rankings. They are sampled
+estimates; inclusive rows overlap. Distinguish application loading, Chrome's
+stop/processing wait, native-session setup, query and export costs. `firstSummaryMs`
+ends at the first saved summary; `totalMs` includes the full evidence archive.
+Native queries report `parseCount: 0` and `reusedNativeParse: true`; their source
+version is the running Chrome. Do not insert agent/tool
+round trips between native start, reload, readiness and stop when this automatic
+transaction is applicable. Raw recordings are never trimmed to hide collection
+costs. Export backfills every saved report with archive bytes, SHA-256 and capture
+validity; wait for archive completion before declaring the evidence complete.
+
+For ordinary performance diagnosis, use Chrome's actual Performance panel.
+Do not create a replacement panel, flame-chart UI, or a new per-task CDP
+recorder. Use the bundled `performance.mjs`:
+
+```powershell
+node "<plugin-root>/scripts/performance.mjs" open --target-exact TARGET_ID
+node "<plugin-root>/scripts/performance.mjs" native-start --target-exact TARGET_ID
+# Perform the requested page operation, or let the user operate Record/Stop.
+node "<plugin-root>/scripts/performance.mjs" native-stop --target-exact TARGET_ID
+node "<plugin-root>/scripts/performance.mjs" analyze-current --target-exact TARGET_ID --output-dir NEW_EVIDENCE_DIR
+```
+
+Reuse the panel and completed recording if the user has already recorded it.
+`analyze-current` directly queries that same recording in Chrome's frontend before
+automatically preserving its full raw trace; the user need not export/import it.
+`result.json` separates first-summary time from total archive time. Read the bounded
+`summary.json` first to explain the result. Keep the full `report.json` on disk;
+query or read only the relevant section when the summary leaves a question.
+Do not print a multi-megabyte report into tool output or conversation context.
+Use `analyze-current --start-ms N --end-ms N` for a completed native recording,
+or `analyze --input ... --start-ms N --end-ms N` for an archived file using the
+pinned offline TraceEngine. Add `--pid`/`--tid` when needed. Keep the raw trace
+for review; generated-source coordinates are not automatically original TS
+coordinates. Do not assert that missing worker/GPU/screenshot tracks exist.
+The first pass calculates native roots and Bottom-up function hotspots without
+expanding call chains. Keep that default for an overview. When a caller chain
+is needed, narrow the time range/thread and add `--expand-call-tree`; expansion
+is bounded by `--max-nodes 100 --max-depth 10`. Larger limits are explicit opt-ins.
+Expanding a large native tree can dominate analysis time.
+
+Reuse a completed recording and its summary before capturing again. Use the
+bundled commands instead of writing a new recorder or analysis script per task.
+The native workflow and summary are sufficient for the first diagnosis; add a
+CPU profile, coverage, FPS run or screenshot only to answer a specific remaining
+question. Do not run every evidence layer for an ordinary performance request.
+
+For unattended loading only, use `record --config <project-scenario.json>` or
+`record --target-exact ID --reload --until "<explicit-ready-condition>"
+--output-dir NEW_DIR`. Supported config fields are `targetId`, `outputDir`,
+`action` (`none`/`reload`/`navigate`), `url`, `stopWhen`, `stableMs`, `pollMs`,
+`maxDurationMs`, optional `durationMs`, `screenshots`, `bufferMb`, `cache`
+(`existing`/`disable-http`), `applicationRevision`, and `milestones` containing
+`name`/`expression`. A polled milestone is an observation with polling
+resolution, not an exact business event. Do not treat HTTP-cache bypass as
+full cold storage. Keep application readiness and model-specific probes in
+the project configuration/adapter.
+
+Existing CPU and FPS scripts below are specialized secondary tools. Full
+Performance diagnosis uses the native recording's JS sampling, network,
+rendering, GC, related threads and native insights together. Final KPIs use
+a separate lightweight run with a matched contract.
+
 ## Evidence layers
 
 Keep these layers separate:
@@ -26,7 +113,7 @@ Keep these layers separate:
 | Input            | direct CDP `wheel-probe`, `pointer`        | exact target, native CDP event, trusted delivery                 |
 | Page diagnostics | MCP console/network/snapshot plus page runtime snapshot | page state, errors, requests, DOM/UI state, heap/DOM/resource/runtime deltas |
 | CPU              | `capture-cpu-profile.mjs` + `analyze-cpu-profile.mjs` (V8 profile) | function-level self/total time, hot source locations, flame graph |
-| Line frequency   | `capture-cpu-profile.mjs --coverage`       | statement-level execution counts per line (not time)             |
+| Line frequency   | `capture-cpu-profile.mjs --coverage`       | coverage range counts projected onto lines (not time)             |
 | Trace            | `capture-trace.mjs` + `analyze-trace.mjs`  | compositor work, long tasks, target-correlated browser display cadence |
 | System GPU       | WPR/GPUView                                | queue, GPU scheduling, Present/DWM attribution                   |
 | WebGL work       | app instrumentation or a graphics debugger | draw calls, passes, state changes, GPU workload                  |
@@ -53,6 +140,23 @@ Before sampling, record and freeze:
 - instrumentation state. Disable tracing, overlays, draw-call logging, and
   DevTools panels for the final KPI sample unless the contract explicitly
   measures that overhead.
+
+Verify scheduling in the document that owns the Canvas under the exact sample
+state. The activation gate checks only the root document: a complete 500 ms
+window, at least 10 rAF callbacks, and no startup, internal, or trailing gap of
+150 ms or more. This is a scheduler diagnostic, not FPS. A visible page, focus
+emulation, lease, or two-frame burst cannot substitute for the gate, and a root
+pass cannot prove iframe scheduling. Independently probe the exact rendering
+iframe when present; reject a throttled sample and report its scope and reason.
+Foreground activation requires an explicit contract, not an implicit recovery.
+
+For drag sampling, use the bounded input transaction and validate its absolute
+send deadlines, event counts, schedule errors, ACK drain, and final release.
+Do not pace events by serial ACK completion. `timing.valid` proves the send/ACK
+contract only; independently check trusted DOM delivery, pointer capture,
+camera response, and changed pixels. Keep ACK latency, send duration, DOM
+delivery duration, and rendering time separate. Recreate old keep-alive workers
+from the updated scripts before testing a plugin update.
 
 ## Automatic FPS workflow
 
@@ -102,10 +206,10 @@ samples that violate any part of the contract instead of averaging them in.
 
 ## Recommended sequence
 
-1. Use the MCP performance category for an exploratory trace or page-level
-   diagnosis. Discover the available trace tools from the connected MCP
-   server; do not assume a tool is available when the server was configured
-   without its category.
+1. Start with the native Performance workflow above and its bounded summary.
+   The following trace, input and CPU workflows are alternatives or targeted
+   follow-ups, not a mandatory sequence for every diagnosis. Use MCP performance
+   tools only for a short exploratory trace; discover configured tools first.
 2. Bind the exact target with direct CDP and run a strict input/visual probe.
 3. Capture a trace on a disposable or controlled target:
 
@@ -201,10 +305,9 @@ deliverable. The final answer to the user is an analysis, never raw data:
   that support it: long tasks with their owning `functionName`/`url`/`line`,
   hot functions by self time, hot lines by execution count when coverage was
   captured.
-- Render the evidence the user cannot read directly: open generated flame
-  graph or report HTML in the controlled Chrome, screenshot it, read the
-  screenshot, and include the image path in the answer. Do not tell the user
-  to open a JSON file to understand the result.
+- Explain the summary in plain language. For visual evidence, reuse the native
+  Performance panel; capture its relevant view when it helps the answer. Do not
+  generate a replacement flame chart or report HTML for ordinary diagnosis.
 - Keep raw artifacts (trace, cpuprofile, summaries, screenshots) on disk and
   list their paths as supporting evidence, labeled as such.
 - Raw JSON is input to the agent's analysis, not the report. If a capture was

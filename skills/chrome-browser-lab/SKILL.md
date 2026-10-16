@@ -12,13 +12,37 @@ not weaken strict test evidence.
 
 ## Transport selection
 
+For a small browser task, use the smallest relevant tool call and return its
+answer. Reuse the known exact page ID during one transaction. Refresh the target
+list when navigation, reload, closure or a failed binding makes it stale.
+For read-only `evaluate_script`, set `waitForStableDom: false`; keep DOM settling
+for actions that change the page. Bound console/network lists with `pageSize`
+and filters. Batch independent reads in one execution instead of creating a new
+model/tool round trip for each. Capture screenshots only when visual evidence
+is relevant. Do not repeat the full performance protocol for ordinary reads.
+
+For Performance recording and analysis, prefer `scripts/performance.mjs open`,
+`native-start`, `native-stop`, and `analyze-current`: they use Chrome's own
+Performance panel and its existing recording. Reuse a recording the user made.
+Do not build a substitute timeline or require manual export/import. For
+unattended application readiness, use the same entrypoint's `record --config`
+workflow. See the performance skill for the recording contract.
+Read its small `summary.json` first and query the complete report only when a
+specific question needs detail. Reuse the bundled command and existing trace;
+do not write a new recording/analysis script for each ordinary request.
+
 Use Chrome DevTools MCP for:
 
 - page lists, DOM/accessibility snapshots, ordinary semantic controls, console
   and network inspection;
-- screenshots, page navigation, performance-panel traces, memory tools, and
+- screenshots, page navigation, short exploratory traces, and
   structured DevTools output;
 - exploratory debugging where a small amount of target abstraction is useful.
+
+The default configuration keeps the usual page/network/performance/debugging
+tools. Experimental vision, screencast, memory, extension, third-party and
+WebMCP tools are not enabled. Discover available tools before relying on them;
+do not treat an intentionally disabled category as a broken server.
 
 Use `scripts/cdp.mjs` for:
 
@@ -47,7 +71,9 @@ sample. Use one transport for setup and keep the sample transport consistent.
 ## Standard workflow
 
 1. Check that the dedicated endpoint is healthy with `cdp.mjs status` and that
-   background scheduling is safe. If Chrome is not running, use `cdp.mjs start`;
+   the required background flags are present. Verify document scheduling
+   separately; status and lease success do not establish background safety.
+   If Chrome is not running, use `cdp.mjs start`;
    do not attach to the user's ordinary profile or an unrelated port.
 2. Run `cdp.mjs list` and bind the exact target ID. Never select a target by a
    partial title when multiple matching pages exist.
@@ -60,6 +86,22 @@ sample. Use one transport for setup and keep the sample transport consistent.
    application revision, input sequence, and output artifact paths.
 6. Clean up only targets, leases, trace files, and temporary probes created by
    the current task. Never close or mutate an existing user target by name.
+
+The activation cadence gate observes the root document for 500 ms, requires
+at least 10 rAF callbacks, and rejects startup, internal, or trailing gaps of
+150 ms or more. Check its explicit `scope`; visible state, focus emulation,
+or two callbacks cannot establish that the Canvas document is active. When the
+Canvas belongs to an iframe, independently verify that exact rendering frame's
+cadence and trusted input/visual response in the sample's foreground or
+background state. A root gate is not an iframe gate. Do not silently activate a
+tab or take OS focus to make a failed background sample appear valid.
+
+Drag input uses a bounded transaction with absolute send deadlines and an
+explicit release. Check its send-timing validity separately from DOM delivery,
+pointer capture, camera changes, and pixels. ACK latency is not transport
+latency by itself; serial ACK waits must not determine benchmark input cadence.
+Existing keep-alive workers retain their old code, so recreate leases from the
+updated script path before validating a plugin update.
 
 The default direct endpoint is `http://127.0.0.1:9333`. The MCP configuration
 is pinned to that endpoint, so it connects to the same dedicated Chrome rather

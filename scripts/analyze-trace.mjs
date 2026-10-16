@@ -7,7 +7,14 @@ import {
   analyzeCompositorFps,
   collectCompositorSwapEvents,
   compositorFrameRateContract,
+  findTargetFrames,
+  findTargetRendererProcesses,
+  resolveTargetFrameBinding,
 } from "./frame-rate.mjs";
+import {
+  DEFAULT_MAX_TRACE_JSON_BYTES,
+  readTraceJsonFile,
+} from "./trace-json.mjs";
 
 const PRESENTATION_EVENT_NAME = "Display::FrameDisplayed";
 const PRESENTATION_REQUIRED_CATEGORIES = [
@@ -33,6 +40,8 @@ const COMPOSITOR_PATTERN =
 const GPU_PATTERN = /swapbuffers|gputask|raster|gpu\./i;
 const LONG_TASK_PATTERN =
   /runtask|functioncall|evaluatescript|eventdispatch|taskqueue|longtask/i;
+const TOP_LEVEL_TASK_PATTERN =
+  /(?:^|::)(?:RunTask|ProcessTaskFromWorkQueue|ThreadPool_RunTask|LongTask)$/i;
 
 function parseArgs(argv) {
   const options = {};
@@ -92,7 +101,11 @@ function analysisWindowFromCaptureResult(captureResult) {
   }
   const startUs = Number(captureWindow.startUs);
   const endUs = Number(captureWindow.endUs);
-  if (!Number.isFinite(startUs) || !Number.isFinite(endUs) || endUs <= startUs) {
+  if (
+    !Number.isFinite(startUs) ||
+    !Number.isFinite(endUs) ||
+    endUs <= startUs
+  ) {
     throw new Error(
       "Invalid capture-result trace.frameRateWindow; expected finite startUs < endUs.",
     );
@@ -135,6 +148,98 @@ function eventInWindow(event, window) {
   if (!window.applied) return true;
   const value = timestamp(event);
   return value !== null && value >= window.startUs && value <= window.endUs;
+}
+
+function clipDurationToWindow(event, window) {
+  if (!window.applied) return event;
+  const start = timestamp(event);
+  const durationUs = Number(event.dur);
+  if (event.ph !== "X" || !Number.isFinite(durationUs) || durationUs <= 0) {
+    return eventInWindow(event, window) ? event : null;
+  }
+  if (start === null) return null;
+  const clippedStart = Math.max(start, window.startUs);
+  const clippedEnd = Math.min(start + durationUs, window.endUs);
+  if (clippedEnd <= clippedStart) return null;
+  return { ...event, ts: clippedStart, dur: clippedEnd - clippedStart };
+}
+
+function synchronousDurationEvents(events) {
+  const durations = [];
+  const byThread = new Map();
+  for (const event of events) {
+    if (timestamp(event) === null) continue;
+    if (event.ph === "X" && durationMs(event) > 0) durations.push(event);
+    if (event.ph !== "B" && event.ph !== "E") continue;
+    const key = `${event.pid ?? "missing"}:${event.tid ?? "missing"}`;
+    const threadEvents = byThread.get(key) ?? [];
+    threadEvents.push(event);
+    byThread.set(key, threadEvents);
+  }
+  let unmatchedBeginCount = 0;
+  let unmatchedEndCount = 0;
+  for (const threadEvents of byThread.values()) {
+    threadEvents.sort((left, right) => timestamp(left) - timestamp(right));
+    const stack = [];
+    for (const event of threadEvents) {
+      if (event.ph === "B") {
+        stack.push(event);
+        continue;
+      }
+      const begin = stack.pop();
+      if (!begin) {
+        unmatchedEndCount += 1;
+        continue;
+      }
+      const dur = timestamp(event) - timestamp(begin);
+      if (dur > 0) durations.push({ ...begin, ph: "X", dur });
+    }
+    unmatchedBeginCount += stack.length;
+  }
+  return { durations, unmatchedBeginCount, unmatchedEndCount };
+}
+
+function isTopLevelTask(event) {
+  return (
+    categories(event).has("toplevel") ||
+    TOP_LEVEL_TASK_PATTERN.test(eventName(event))
+  );
+}
+
+function collectTaskRoots(events) {
+  const normalized = synchronousDurationEvents(events);
+  const byThread = new Map();
+  for (const event of normalized.durations) {
+    if (!isTopLevelTask(event) && !LONG_TASK_PATTERN.test(eventName(event))) {
+      continue;
+    }
+    const key = `${event.pid ?? "missing"}:${event.tid ?? "missing"}`;
+    const candidates = byThread.get(key) ?? [];
+    candidates.push(event);
+    byThread.set(key, candidates);
+  }
+  const roots = [];
+  let overlappingRootCount = 0;
+  for (const candidates of byThread.values()) {
+    candidates.sort(
+      (left, right) =>
+        timestamp(left) - timestamp(right) ||
+        durationMs(right) - durationMs(left) ||
+        Number(isTopLevelTask(right)) - Number(isTopLevelTask(left)),
+    );
+    let coveredEnd = -Infinity;
+    for (const event of candidates) {
+      const start = timestamp(event);
+      const end = start + Number(event.dur);
+      // RunTask and nested FunctionCall/EvaluateScript/EventDispatch describe
+      // the same occupied task. Never count each nested slice as another task.
+      if (end <= coveredEnd) continue;
+      if (start < coveredEnd) overlappingRootCount += 1;
+      roots.push(event);
+      coveredEnd = end;
+    }
+  }
+  return { ...normalized, roots, overlappingRootCount };
 }
 
 function quantile(values, fraction) {
@@ -543,6 +648,12 @@ function assessPresentationTargetCorrelation(
           (value) => value <= MAX_PRESENTATION_ALIGNMENT_MS,
         ).length / compositor.length;
   const invalidReasons = [];
+  invalidReasons.push(
+    ...(compositorCollection.frameBinding?.invalidReasons ?? []),
+  );
+  invalidReasons.push(
+    ...(compositorCollection.targetFrameCorrelationInvalidReasons ?? []),
+  );
   if (compositorCollection.targetBound !== true) {
     invalidReasons.push("presentation-target-renderer-not-found");
   }
@@ -596,25 +707,58 @@ function topCounts(events, selector, limit = 20) {
     .map(([name, count]) => ({ name, count }));
 }
 
-function summarizeLongTasks(events, thresholdMs, limit = 25) {
-  return events
-    .filter(
-      (event) =>
-        event.ph === "X" &&
-        durationMs(event) >= thresholdMs &&
-        LONG_TASK_PATTERN.test(eventName(event)),
-    )
-    .sort((left, right) => durationMs(right) - durationMs(left))
+function summarizeLongTasks(events, thresholdMs, window, limit = 25) {
+  const collection = collectTaskRoots(events);
+  const tasks = collection.roots
+    // Long-task qualification uses the complete task; time attribution uses
+    // only its overlap with the selected range, like a timeline selection.
+    .filter((event) => durationMs(event) >= thresholdMs)
+    .flatMap((event) => {
+      const clipped = clipDurationToWindow(event, window);
+      return clipped ? [{ event, clipped }] : [];
+    });
+  const top = tasks
+    .sort((left, right) => durationMs(right.clipped) - durationMs(left.clipped))
     .slice(0, limit)
-    .map((event) => ({
+    .map(({ event, clipped }) => ({
       name: eventName(event),
       category: event.cat || "",
-      durationMs: durationMs(event),
-      timestampUs: timestamp(event),
+      durationMs: durationMs(clipped),
+      timestampUs: timestamp(clipped),
+      fullDurationMs: durationMs(event),
+      originalTimestampUs: timestamp(event),
+      clippedToWindow: durationMs(clipped) !== durationMs(event),
+      source: isTopLevelTask(event)
+        ? "top-level-task"
+        : "inferred-root-duration-event",
       pid: event.pid ?? null,
       tid: event.tid ?? null,
       args: event.args || {},
     }));
+  const inferredRootCount = tasks.filter(
+    ({ event }) => !isTopLevelTask(event),
+  ).length;
+  return {
+    thresholdMs,
+    count: tasks.length,
+    topLevelTaskCount: tasks.length - inferredRootCount,
+    inferredRootCount,
+    selectedDurationMs: tasks.reduce(
+      (sum, { clipped }) => sum + durationMs(clipped),
+      0,
+    ),
+    top,
+    overlappingRootCount: collection.overlappingRootCount,
+    unmatchedBeginCount: collection.unmatchedBeginCount,
+    unmatchedEndCount: collection.unmatchedEndCount,
+    definition:
+      "Per-thread outermost synchronous task slices; full task duration qualifies the threshold, only selected-window overlap contributes time.",
+    limitations: [
+      "Standalone FunctionCall/EvaluateScript/EventDispatch slices without a wrapping task are explicitly inferred roots, not confirmed browser tasks.",
+      "Counts include all selected renderer threads; they are not the main-thread-only Long Tasks API metric.",
+      "Unmatched begin/end or overlapping root slices indicate incomplete or malformed synchronous nesting and must be inspected before attribution.",
+    ],
+  };
 }
 
 function analyzeTrace(
@@ -637,14 +781,21 @@ function analyzeTrace(
     .filter((value) => value !== null && value > 0)
     .sort((left, right) => left - right);
   const firstTimestamp = traceTimestamps[0] ?? null;
-  const lastTimestamp = traceTimestamps.at(-1) ?? null;
+  const lastTimestamp = events.reduce((last, event) => {
+    const start = timestamp(event);
+    if (start === null || start <= 0) return last;
+    const end =
+      event.ph === "X" ? start + Math.max(0, durationMs(event) * 1000) : start;
+    return Math.max(last ?? end, end);
+  }, null);
   const traceDurationMs =
     firstTimestamp !== null && lastTimestamp !== null
       ? (lastTimestamp - firstTimestamp) / 1000
       : null;
-  const analysisEvents = events.filter((event) =>
-    eventInWindow(event, requestedWindow),
-  );
+  const analysisEvents = events.flatMap((event) => {
+    const clipped = clipDurationToWindow(event, requestedWindow);
+    return clipped ? [clipped] : [];
+  });
   const windowInvalidReasons = assessWindow(
     requestedWindow,
     firstTimestamp,
@@ -652,6 +803,26 @@ function analyzeTrace(
     analysisEvents.length,
   );
   const nameMaps = metadataNameMaps(events);
+  const frameBinding = resolveTargetFrameBinding(
+    targetId,
+    captureResult?.targetFrameBinding,
+  );
+  const rootFrameId = frameBinding.rootFrameId;
+  const targetFrames = findTargetFrames(events, rootFrameId);
+  const targetFrameIds = new Set(targetFrames.map((frame) => frame.frame));
+  const targetRendererProcessIds = new Set(
+    findTargetRendererProcesses(events, rootFrameId),
+  );
+  // Preserve full task boundaries until nesting and threshold classification
+  // are complete. Cropping first can turn a nested child into a false root.
+  const targetCpuEvents =
+    targetId === null
+      ? events
+      : events.filter((event) => {
+          if (!targetRendererProcessIds.has(Number(event.pid))) return false;
+          const frame = event.args?.data?.frame;
+          return typeof frame !== "string" || targetFrameIds.has(frame);
+        });
   const presentationCandidates = analysisEvents.filter(
     (event) => eventName(event) === PRESENTATION_EVENT_NAME,
   );
@@ -675,8 +846,12 @@ function analyzeTrace(
   const compositorEvents = analysisEvents.filter((event) =>
     COMPOSITOR_PATTERN.test(eventName(event)),
   );
-  const gpuEvents = analysisEvents.filter((event) =>
-    GPU_PATTERN.test(eventName(event)),
+  const gpuEvents = analysisEvents.filter(
+    (event) =>
+      GPU_PATTERN.test(eventName(event)) &&
+      (targetId === null ||
+        targetRendererProcessIds.has(Number(event.pid)) ||
+        targetRendererProcessIds.has(Number(event.args?.data?.renderer_pid))),
   );
   const presentationTimestamps = validatedPresentationEvents
     .map(timestamp)
@@ -703,10 +878,12 @@ function analyzeTrace(
   };
   const compositorCollection = collectCompositorSwapEvents(events, {
     targetId,
+    frameBinding: captureResult?.targetFrameBinding ?? null,
     window: requestedWindow,
   });
   const compositorFrameRate = analyzeCompositorFps(events, {
     targetId,
+    frameBinding: captureResult?.targetFrameBinding ?? null,
     window: requestedWindow,
   });
   const presentationTargetCorrelation = assessPresentationTargetCorrelation(
@@ -751,10 +928,33 @@ function analyzeTrace(
       durationMs: requestedWindow.applied
         ? (requestedWindow.endUs - requestedWindow.startUs) / 1000
         : traceDurationMs,
-      eventTimestampFilter: "inclusive-start-and-end",
+      eventTimestampFilter:
+        "points-inclusive-start-and-end; durations-positive-overlap-clipped",
       invalidReasons: windowInvalidReasons,
     },
     traceIntegrity,
+    targetDiagnostics: {
+      targetId,
+      rootFrameId,
+      frameBinding,
+      frameIds: [...targetFrameIds],
+      rendererProcessIds: [...targetRendererProcessIds],
+      cpuScope:
+        targetId === null
+          ? "all-trace"
+          : "target-frame-when-present-otherwise-renderer-process",
+      gpuScope:
+        targetId === null
+          ? "all-trace"
+          : "renderer-process-or-explicit-renderer_pid-owner",
+      unassignedGpuEventCount:
+        analysisEvents.filter((event) => GPU_PATTERN.test(eventName(event)))
+          .length - gpuEvents.length,
+      limitations: [
+        "Tasks without frame IDs cannot distinguish pages sharing a renderer process.",
+        "GPU-service events without a renderer owner remain unassigned; durations are not hardware GPU execution time.",
+      ],
+    },
     evidence: {
       presentation: {
         valid: presentationEvidenceValid,
@@ -798,7 +998,7 @@ function analyzeTrace(
       compositorFrameRate,
       gpu: {
         eventCount: gpuEvents.length,
-        topEvents: topCounts(analysisEvents, (event) =>
+        topEvents: topCounts(gpuEvents, (event) =>
           GPU_PATTERN.test(eventName(event)),
         ),
       },
@@ -828,16 +1028,11 @@ function analyzeTrace(
         targetCorrelation: presentationTargetCorrelation,
       },
     },
-    longTasks: {
+    longTasks: summarizeLongTasks(
+      targetCpuEvents,
       thresholdMs,
-      count: analysisEvents.filter(
-        (event) =>
-          event.ph === "X" &&
-          durationMs(event) >= thresholdMs &&
-          LONG_TASK_PATTERN.test(eventName(event)),
-      ).length,
-      top: summarizeLongTasks(analysisEvents, thresholdMs),
-    },
+      requestedWindow,
+    ),
     eventCounts: {
       presentation: topCounts(
         analysisEvents,
@@ -850,9 +1045,7 @@ function analyzeTrace(
       compositor: topCounts(analysisEvents, (event) =>
         COMPOSITOR_PATTERN.test(eventName(event)),
       ),
-      gpu: topCounts(analysisEvents, (event) =>
-        GPU_PATTERN.test(eventName(event)),
-      ),
+      gpu: topCounts(gpuEvents, (event) => GPU_PATTERN.test(eventName(event))),
     },
     limitations: [
       "Only validated Display::FrameDisplayed events can produce the presentation KPI; FramePresented is retained as a marker only.",
@@ -882,9 +1075,14 @@ async function main() {
   const requestedWindow = explicitWindow.applied
     ? explicitWindow
     : analysisWindowFromCaptureResult(captureResult);
-  const payload = JSON.parse(
-    await fs.readFile(path.resolve(options.input), "utf8"),
+  const maxParseBytes = numberOption(
+    options,
+    "max-parse-bytes",
+    DEFAULT_MAX_TRACE_JSON_BYTES,
   );
+  const payload = await readTraceJsonFile(path.resolve(options.input), {
+    maxBytes: maxParseBytes,
+  });
   const summary = analyzeTrace(
     payload,
     thresholdMs,
@@ -910,7 +1108,8 @@ export { analyzeTrace };
 
 const isDirectExecution =
   process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+  path.resolve(process.argv[1]) ===
+    path.resolve(fileURLToPath(import.meta.url));
 
 if (isDirectExecution) {
   main().catch((error) => {
