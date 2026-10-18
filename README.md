@@ -64,14 +64,13 @@ DSH reads a bundle manifest from the root `package.json`: `dsh.bundle.patch`
 points at `cordis.patch.yml`, which registers the same Chrome DevTools MCP
 server as `.mcp.json`. In DSH, open **Settings → Plugins → Add**, then enter the
 repository or a local clone as the install spec; for a local clone the spec is
-`file:D:/path/to/chrome-devtools-lab`. Restart DSH after the first install so
-the bundle composition is rebuilt. The server's tools appear as
+`file:D:/path/to/chrome-devtools-lab`. With HMR enabled, the bundle applies
+without a restart; restart DSH if HMR is off. The server's tools appear as
 `mcp__chrome__<tool>`, and the whole plugin can be enabled or disabled as one
 row in the plugin page.
 
-The patch starts the server through `npx`, so `node` and `npx` must be on the
-PATH of the process that starts DSH. Start the CDP endpoint before using the
-tools:
+The patch starts the server through `node`, so `node` must be on the PATH of
+the process that starts DSH. Start the CDP endpoint before using the tools:
 
 ```powershell
 node scripts/cdp.mjs start

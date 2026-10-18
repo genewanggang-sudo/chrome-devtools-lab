@@ -4,10 +4,11 @@
 # `.mcp.json` (Codex) and the inline `mcpServers` block in
 # `.zcode-plugin/plugin.json` (ZCode): same wrapper script, endpoint, and flags.
 #
-# The wrapper is started from the package root, so `cwd` is the package itself
-# and the argument is package-relative. A host that cannot set that working
-# directory can override `cwd` and `command` with absolute paths in its profile
-# patch instead of editing this file.
+# DSH loads a bundle from the profile's `node_modules`, so a relative `cwd: .`
+# would resolve against the Harness process instead of this package. Both paths
+# are therefore derived from the Loader's profile base URL at activation time:
+# `<profile>/node_modules/chrome-devtools-lab`. Keep the package name aligned
+# with `package.json`; an aliased install needs this expression adjusted.
 #
 # The server attaches to a Chrome instance that is already listening on the CDP
 # endpoint, so start one first:
@@ -24,9 +25,9 @@
         serverName: chrome
         transport: stdio
         command: node
-        cwd: .
+        cwd: !!js decodeURIComponent(new URL('node_modules/chrome-devtools-lab', ctx.baseUrl).pathname).replace(/^\/([A-Za-z]:)/, '$1')
         args:
-          - 'scripts/devtools-mcp.mjs'
+          - !!js decodeURIComponent(new URL('node_modules/chrome-devtools-lab/scripts/devtools-mcp.mjs', ctx.baseUrl).pathname).replace(/^\/([A-Za-z]:)/, '$1')
           - '--browserUrl'
           - 'http://127.0.0.1:9333'
           - '--pageIdRouting'
