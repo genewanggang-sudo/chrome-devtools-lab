@@ -1,0 +1,41 @@
+# DSH bundle patch for chrome-devtools-lab.
+#
+# Registers the Chrome DevTools MCP server that this repository ships, mirroring
+# `.mcp.json` (Codex) and the inline `mcpServers` block in
+# `.zcode-plugin/plugin.json` (ZCode): same wrapper script, endpoint, and flags.
+#
+# The wrapper is started from the package root, so `cwd` is the package itself
+# and the argument is package-relative. A host that cannot set that working
+# directory can override `cwd` and `command` with absolute paths in its profile
+# patch instead of editing this file.
+#
+# The server attaches to a Chrome instance that is already listening on the CDP
+# endpoint, so start one first:
+#
+#   node scripts/cdp.mjs start
+#
+# Tool names surface as mcp__chrome__<tool>. Keep this file in sync with
+# `.mcp.json` when the MCP arguments change, and bump `version` in
+# `package.json` and both host manifests together.
+- insert:
+    - id: chrome-devtools-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: chrome
+        transport: stdio
+        command: node
+        cwd: .
+        args:
+          - 'scripts/devtools-mcp.mjs'
+          - '--browserUrl'
+          - 'http://127.0.0.1:9333'
+          - '--pageIdRouting'
+          - '--experimentalDevtools'
+          - '--experimentalStructuredContent'
+          - '--no-category-memory'
+          - '--no-usage-statistics'
+          - '--no-performance-crux'
+          - '--redactNetworkHeaders'
+        env:
+          CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: '1'
+        failOnStartupError: false

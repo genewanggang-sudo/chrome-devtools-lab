@@ -58,12 +58,37 @@ Skill instructions locate the bundled scripts relative to the SKILL.md file
 (`<this-skill-directory>/../../scripts/`), so no host-specific install path
 is referenced.
 
+## Install Into DSH
+
+DSH reads a bundle manifest from the root `package.json`: `dsh.bundle.patch`
+points at `cordis.patch.yml`, which registers the same Chrome DevTools MCP
+server as `.mcp.json`. In DSH, open **Settings → Plugins → Add**, then enter the
+repository or a local clone as the install spec; for a local clone the spec is
+`file:D:/path/to/chrome-devtools-lab`. Restart DSH after the first install so
+the bundle composition is rebuilt. The server's tools appear as
+`mcp__chrome__<tool>`, and the whole plugin can be enabled or disabled as one
+row in the plugin page.
+
+The patch starts the server through `npx`, so `node` and `npx` must be on the
+PATH of the process that starts DSH. Start the CDP endpoint before using the
+tools:
+
+```powershell
+node scripts/cdp.mjs start
+```
+
+Skills are discovered from the host's skill roots rather than from this package.
+To use `skills/chrome-browser-lab`, `skills/chrome-direct-cdp`, and
+`skills/chrome-performance-lab` in DSH, link or copy them into a skill root such
+as `%USERPROFILE%\.dsh\skills`.
+
 ### Manifest sync note
 
 `.zcode-plugin/plugin.json` inlines the MCP server definition because ZCode
 manifests use inline `mcpServers`. When the MCP configuration changes, update
-`.mcp.json` and the inline `mcpServers` block together, and bump `version` in
-both manifests so each host sees the upgrade.
+`.mcp.json`, the inline `mcpServers` block, and the `args` list in
+`cordis.patch.yml` together, and bump `version` in `package.json` and both host
+manifests so each host sees the upgrade.
 
 ## Native Performance Recording
 
@@ -268,6 +293,22 @@ node scripts/cdp.mjs wheel-probe --target-exact TARGET_ID --x 600 --y 400 --delt
 ```
 
 Always list targets immediately before a run and bind the exact current target ID. Reusing a stale target ID can silently measure a different page or fail after a reload.
+
+### Detached Chrome lifecycle
+
+`cdp.mjs start` launches Chrome as a child of the calling shell, so a host that
+tears that shell down can take the browser with it. When the dedicated instance
+must outlive the command that started it — an agent step, a task runner, a
+scheduled gate — use the detached launcher instead:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-chrome-detached.ps1
+```
+
+It reuses an existing listener on the port, creates the browser through
+`Win32_Process.Create` so it is parented to `WmiPrvSE` rather than the shell, and
+waits for `/json/version` to answer. `-Port`, `-UserDataDir`, `-ChromePath`, and
+`-StartUrl` override the defaults; it never touches a normal Chrome profile.
 
 ## Validation
 

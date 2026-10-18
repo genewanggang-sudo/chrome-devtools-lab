@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome DevTools Lab",
+    "description": "Chrome 浏览器控制与性能取证：DevTools MCP 工具集，外加直连 CDP 脚本。"
+  }
+}
