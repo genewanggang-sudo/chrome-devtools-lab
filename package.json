@@ -1,6 +1,6 @@
 {
   "name": "chrome-devtools-lab",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Chrome browser control and performance evidence tooling: Chrome DevTools MCP plus direct CDP scripts.",
   "license": "MIT",
   "private": true,

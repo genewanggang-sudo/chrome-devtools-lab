@@ -1,6 +1,6 @@
 {
   "name": "chrome-devtools-lab",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "A maintainable Chrome browser testing, debugging, control, and performance-analysis toolkit.",
   "author": {
     "name": "Gene Wang",
@@ -40,9 +40,9 @@
   "mcpServers": {
     "chrome-devtools": {
       "command": "node",
-      "cwd": ".",
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "args": [
-        "scripts/devtools-mcp.mjs",
+        "${CLAUDE_PLUGIN_ROOT}/scripts/devtools-mcp.mjs",
         "--browserUrl",
         "http://127.0.0.1:9333",
         "--pageIdRouting",

@@ -24,23 +24,33 @@ async function matchingPackage(file) {
   }
 }
 
-async function npmCLI() {
-  const candidates = [
-    path.join(
-      path.dirname(process.execPath),
-      "node_modules",
-      "npm",
-      "bin",
-      "npm-cli.js",
-    ),
-    ...(process.env.PATH ?? "")
+function npmCliCandidates() {
+  const suffix = ["node_modules", "npm", "bin", "npm-cli.js"];
+  const roots = [
+    // Hosts may run this server with a bundled Node that has no npm next to
+    // it, while the machine keeps a full Node.js install elsewhere. Prefer
+    // an explicit override, then the usual install locations.
+    process.env.CHROME_LAB_NPM_CLI ? [process.env.CHROME_LAB_NPM_CLI] : [],
+    [path.dirname(process.execPath)],
+    (process.env.PATH ?? "")
       .split(path.delimiter)
-      .filter(Boolean)
-      .map((directory) =>
-        path.join(directory, "node_modules", "npm", "bin", "npm-cli.js"),
-      ),
-  ];
-  for (const candidate of candidates) {
+      .filter(Boolean),
+    process.env.NVM_SYMLINK ? [process.env.NVM_SYMLINK] : [],
+    process.env.ProgramFiles
+      ? [path.join(process.env.ProgramFiles, "nodejs")]
+      : [],
+    process.env["ProgramFiles(x86)"]
+      ? [path.join(process.env["ProgramFiles(x86)"], "nodejs")]
+      : [],
+    process.env.APPDATA ? [path.join(process.env.APPDATA, "npm")] : [],
+  ].flat();
+  return roots.map((root) =>
+    root.endsWith("npm-cli.js") ? root : path.join(root, ...suffix),
+  );
+}
+
+async function npmCLI() {
+  for (const candidate of npmCliCandidates()) {
     try {
       await fs.access(candidate);
       return candidate;
@@ -49,7 +59,7 @@ async function npmCLI() {
     }
   }
   throw new Error(
-    "A matching native DevTools runtime was not installed, and npm-cli.js could not be found. Run npm ci in the plugin directory.",
+    "A matching native DevTools runtime was not installed, and npm-cli.js could not be found. Set CHROME_LAB_NPM_CLI to a npm-cli.js path, install Node.js with npm, or run npm ci in the plugin directory.",
   );
 }
 
