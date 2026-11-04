@@ -10,6 +10,23 @@ Chrome DevTools MCP server with the bundled direct CDP client. Keep the two
 transports on different responsibilities so that convenient inspection does
 not weaken strict test evidence.
 
+## Default interaction recipe (routine tasks)
+
+Every model turn costs seconds; every extra command is overhead. For routine
+browsing and UI checks, minimize round trips:
+
+1. `navigate_page` (or `new_page`) → `take_snapshot` → act on the returned
+   `uid`s (`click`, `fill`). Three calls is the ceiling for a simple
+   interaction. Do not prepend status/list/target binding for these tasks;
+   exact-target binding is the direct-CDP contract, not the daily path.
+2. Batch multi-step DOM work into ONE `evaluate_script` that performs the
+   actions and returns the results (call `.click()` on elements, then read
+   state in the same expression). One call replaces a click-then-verify loop.
+3. Verify once at the end, not after every step. Read-only
+   `evaluate_script` must pass `waitForStableDom: false`.
+4. Use the strict direct-CDP contract only for trusted-input evidence,
+   wheel/drag benchmarks, leases, and performance contracts.
+
 ## Transport selection
 
 For a small browser task, use the smallest relevant tool call and return its

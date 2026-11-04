@@ -5,6 +5,11 @@ description: Control a dedicated Chrome instance directly through CDP with exact
 
 # Direct CDP
 
+This is the strict-evidence channel: trusted input, benchmarks, leases, and
+performance contracts. Routine browsing and UI checks belong to the Chrome
+DevTools MCP path (see the chrome-browser-lab default interaction recipe);
+do not apply this contract's status/list/bind ceremony to them.
+
 ## Locating the bundled scripts
 
 The bundled scripts live in `scripts/` at the plugin root. Resolve them
